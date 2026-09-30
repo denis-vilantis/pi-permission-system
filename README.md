@@ -18,6 +18,42 @@
 >
 > Everything else is upstream at v32.0.4. Sync by cherry-picking upstream package commits.
 
+## Building with Nix
+
+The repo is a flake. `nix build` produces the extension package: `package.json`, `src/`,
+and a `node_modules/` containing only the runtime dependencies (`zod`, `tree-sitter-bash`,
+`web-tree-sitter`). pi loads `src/index.ts` through its own runtime, and the bash parser
+resolves its wasm files from `node_modules` at run time, so there is no build step.
+
+```sh
+nix build .#                # -> $out = package dir with package.json + src + node_modules
+nix develop                 # bun + bun2nix for regenerating bun.nix
+```
+
+Dependencies are pinned by `bun.lock` and converted to `bun.nix` (consumed by
+`fetchBunDeps`). After changing dependencies, regenerate both:
+
+```sh
+bun install                 # must be bun 1.3.x: 1.4 writes lockfileVersion 2
+bunx bun2nix -o bun.nix
+```
+
+Two quirks of the current toolchain, encoded in the committed files:
+
+- `bun2nix` 2.1.2 rejects `lockfileVersion: 2`, which bun 1.4 writes. Generate the lock
+  with bun 1.3.x until bun2nix supports v2.
+- bun 1.3.13 writes an empty integrity for `@earendil-works/pi-agent-core`,
+  `@earendil-works/pi-ai`, and the nested `pi-coding-agent/pi-tui` entry even though the
+  registry serves `sha512` for them. The committed `bun.lock` carries the registry
+  integrity for those entries; keep it when regenerating, or `fetchBunDeps` emits
+  `hash = ""` and the build fails with a hash mismatch.
+
+Deployment note: the permission system reads its config and writes logs under
+`<agentDir>/extensions/pi-permission-system/`. Load this package from a path that does
+**not** occupy that directory name — for example as a local-path package in
+`settings.json` (`packages: ["${nix store path}"]`), or as an extension directory with a
+different basename.
+
 [![npm version](https://img.shields.io/npm/v/@gotgenes/pi-permission-system?style=flat&logo=npm&logoColor=white)](https://www.npmjs.com/package/@gotgenes/pi-permission-system) [![CI](https://img.shields.io/github/actions/workflow/status/gotgenes/pi-packages/ci.yml?style=flat&logo=github&label=CI)](https://github.com/gotgenes/pi-packages/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat)](https://opensource.org/licenses/MIT) [![TypeScript](https://img.shields.io/badge/TypeScript-6.x-3178C6?style=flat&logo=typescript&logoColor=white)](https://www.typescriptlang.org/) [![pnpm](https://img.shields.io/badge/pnpm-%3E%3D11-F69220?style=flat&logo=pnpm&logoColor=white)](https://pnpm.io/) [![Pi Package](https://img.shields.io/badge/Pi-Package-6366F1?style=flat)](https://pi.mariozechner.at/)
 
 Permission enforcement extension for the [Pi](https://pi.mariozechner.at/) coding agent that provides centralized, deterministic permission gates over tool, bash, MCP, skill, and special operations.

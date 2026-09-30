@@ -1,11 +1,12 @@
 # Build
 dist/
 *.tsbuildinfo
+result
+result-*
 
 # Dependencies
 node_modules/
 .pi/npm/
-bun.lock
 
 # Logs
 logs/
