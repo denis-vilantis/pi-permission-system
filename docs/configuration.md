@@ -50,7 +50,7 @@ This clamp is deny-preserving and, like `yoloMode`, applied at composition; when
 
 ```jsonc
 {
-  "$schema": "https://raw.githubusercontent.com/gotgenes/pi-packages/main/packages/pi-permission-system/schemas/permissions.schema.json",
+  "$schema": "https://raw.githubusercontent.com/denis-vilantis/pi-permission-system/main/schemas/permissions.schema.json",
 
   // Runtime knobs
   "debugLog": false,
@@ -62,7 +62,14 @@ This clamp is deny-preserving and, like `yoloMode`, applied at composition; when
 
   // Non-bash tools that carry shell semantics
   "shellTools": {
-    "exec_command": { "commandArgument": "cmd", "workdirArgument": "workdir" }
+    "exec_command": { "commandArgument": "cmd", "workdirArgument": "workdir" },
+    "ctx_execute": {
+      "commandArgument": "code",
+      "workdirArgument": "cwd",
+      "whenArgument": "language",
+      "whenEquals": ["shell"]
+    },
+    "ctx_batch_execute": { "commandArgument": "commands", "commandItemArgument": "command" }
   },
 
   // Ordered names of registered live-authority chain links (empty = none)
@@ -187,17 +194,42 @@ Each key is a tool name; its value maps the tool's input arguments (the keys of 
 ```jsonc
 {
   "shellTools": {
-    "exec_command": { "commandArgument": "cmd", "workdirArgument": "workdir" }
+    "exec_command": { "commandArgument": "cmd", "workdirArgument": "workdir" },
+    "ctx_execute": {
+      "commandArgument": "code",
+      "workdirArgument": "cwd",
+      "whenArgument": "language",
+      "whenEquals": ["shell"]
+    },
+    "ctx_batch_execute": { "commandArgument": "commands", "commandItemArgument": "command" }
   }
 }
 ```
 
-| Field             | Required | Description                                                               |
-| ----------------- | -------- | ------------------------------------------------------------------------- |
-| `commandArgument` | yes      | The tool's input argument holding the shell command string (e.g. `cmd`).  |
-| `workdirArgument` | no       | The tool's input argument holding the working directory (e.g. `workdir`). |
+| Field                 | Required | Description                                                                                                                                        |
+| --------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `commandArgument`     | yes      | The tool's input argument holding the shell command string (e.g. `cmd`), or an array of command items when `commandItemArgument` is set.           |
+| `workdirArgument`     | no       | The tool's input argument holding the working directory (e.g. `workdir`).                                                                          |
+| `whenArgument`        | no       | The tool's input argument that gates the alias (e.g. `language`); the alias applies only when that argument's value matches `whenEquals`.           |
+| `whenEquals`          | no       | The value, or array of values, of `whenArgument` that enables the alias. Requires `whenArgument`; when omitted, the argument's truthiness decides. |
+| `commandItemArgument` | no       | The item field holding a command when `commandArgument` is an array (e.g. `command`); the items are joined and gated as one shell program.         |
 
 When `workdirArgument` is set, the tool's working directory is the base the command's relative paths resolve against, and the working directory itself is gated by `external_directory` when it falls outside the session's working directory.
+
+`whenArgument`/`whenEquals` restrict the alias to matching calls.
+The tool is gated as a shell only when its `whenArgument` value equals one of `whenEquals` (a string or an array of strings); a call that does not match keeps the tool's normal extension surface.
+That is how a code-execution tool whose `language` argument decides whether its `code` is shell — as `ctx_execute` in the example above — gets full bash parity for shell calls without parsing Python, JavaScript, or Go as shell.
+
+When `commandArgument` resolves to an array, `commandItemArgument` names the item field that holds each command — for example a batch tool's `commands: [{ label, command }]`.
+The commands are joined with newlines and gated as one shell program, so decomposition, wrapper flooring, path gates, and `bash:` rules apply to every item:
+
+```jsonc
+{
+  "shellTools": {
+    "ctx_batch_execute": { "commandArgument": "commands", "commandItemArgument": "command" }
+  }
+}
+```
 
 Merge semantics: `shellTools` **shallow-merges by tool name** across global → project.
 A project entry overrides a specific tool's mapping on a key collision but never drops a global entry — so adding a project-scoped alias cannot silently remove enforcement for a tool the global config already covers.
@@ -1248,7 +1280,7 @@ npx --yes ajv-cli@5 validate \
 **Editor tip:** Add the hosted schema URL as the `$schema` key in your config for autocomplete and validation support:
 
 ```json
-"$schema": "https://raw.githubusercontent.com/gotgenes/pi-packages/main/packages/pi-permission-system/schemas/permissions.schema.json"
+"$schema": "https://raw.githubusercontent.com/denis-vilantis/pi-permission-system/main/schemas/permissions.schema.json"
 ```
 
 The well-known surface keys — `*`, `path`, `external_directory`, `bash`, `mcp`, `skill`, and the four directional keys — are named properties in the schema, so an editor completes them and shows each key's own documentation on hover; any other registered tool name still validates as a surface.

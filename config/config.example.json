@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/gotgenes/pi-packages/main/packages/pi-permission-system/schemas/permissions.schema.json",
+  "$schema": "https://raw.githubusercontent.com/denis-vilantis/pi-permission-system/main/schemas/permissions.schema.json",
 
   "debugLog": false,
   "permissionReviewLog": true,
@@ -18,7 +18,14 @@
   "authorizerChain": [],
 
   "shellTools": {
-    "exec_command": { "commandArgument": "cmd", "workdirArgument": "workdir" }
+    "exec_command": { "commandArgument": "cmd", "workdirArgument": "workdir" },
+    "ctx_execute": {
+      "commandArgument": "code",
+      "workdirArgument": "cwd",
+      "whenArgument": "language",
+      "whenEquals": ["shell"]
+    },
+    "ctx_batch_execute": { "commandArgument": "commands", "commandItemArgument": "command" }
   },
 
   "permission": {
