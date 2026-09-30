@@ -1,0 +1,25 @@
+# Build
+dist/
+*.tsbuildinfo
+
+# Dependencies
+node_modules/
+.pi/npm/
+bun.lock
+
+# Logs
+logs/
+*.log
+
+# Coverage
+coverage/
+*.lcov
+.nyc_output/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
