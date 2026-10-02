@@ -75,6 +75,25 @@ describe("classifyWrapperWords", () => {
     it("does not flag a bare search", () => {
       expect(classifyWrapperWords(words("find . -name x"))).toBeUndefined();
     });
+
+    it.each(["env", "env FOO=bar", "env -u FOO"])(
+      "does not flag operand-less %s (#1)",
+      (unit) => {
+        expect(classifyWrapperWords(words(unit))).toBeUndefined();
+      },
+    );
+
+    it.each([
+      "env FOO=bar rm -rf /tmp/x",
+      "env -S 'rm x'",
+      "env --split-string=rm",
+      "env -iS'rm x'",
+      "sudo -s",
+      "sudo",
+      "parallel",
+    ])("still flags %s", (unit) => {
+      expect(classifyWrapperWords(words(unit))).toBe("indirection");
+    });
   });
 
   describe("ordinary commands", () => {

@@ -54,9 +54,31 @@ export function classifyWrapperWords(
   if (SHELL_WRAPPER_NAMES.has(commandName) && hasShortFlagC(args)) {
     return "opaque-payload";
   }
-  if (INDIRECTION_WRAPPER_NAMES.has(commandName)) return "indirection";
+  if (INDIRECTION_WRAPPER_NAMES.has(commandName)) {
+    return isOperandlessEnv(commandName, words, args) ? undefined : "indirection";
+  }
   if (execFlagIndex(commandName, args) !== -1) return "indirection";
   return undefined;
+}
+
+/**
+ * `env` with no command to run (`env`, `env FOO=bar`, `env -u FOO`) only prints
+ * the environment, so there is nothing hidden for the floor to guard (#1). Any
+ * `-S`/`--split-string` keeps the floor: its value is a command line `env`
+ * runs, though no inner command word is visible. Scoped to `env` because other
+ * wrappers run something with no visible inner word (`sudo -s`, bare
+ * `parallel`, `flock -c`).
+ */
+function isOperandlessEnv(
+  commandName: string,
+  words: readonly CommandWord[],
+  args: readonly string[],
+): boolean {
+  return (
+    commandName === "env" &&
+    innerCommandIndex(words) === -1 &&
+    !args.some((arg) => /^-[^-]*S|^--split-string/.test(arg))
+  );
 }
 
 // ── Wrapper vocabulary ───────────────────────────────────────────────────────
