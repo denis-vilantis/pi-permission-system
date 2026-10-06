@@ -57,7 +57,7 @@ function pathAccessFor(
   n: PathNormalizer = normalizer,
 ): ToolPathAccess {
   const path = n.forPath(pathValue);
-  return { path, approvalPattern: n.approvalPatternFor(path) };
+  return { path, approvalPatterns: n.approvalPatternsFor(path) };
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -145,6 +145,51 @@ describe("describeToolGate", () => {
     expect(desc.surface).toBe("mcp");
     expect(desc.decision.surface).toBe("mcp");
     expect(desc.decision.value).toBe("server:tool");
+  });
+
+  describe("a Pi MCP tool (mcp__<server>__<tool>)", () => {
+    const toolName = "mcp__danger_srv__wipe";
+    const check = makeCheckResult("ask", {
+      toolName,
+      source: "mcp",
+      target: "danger-srv",
+      matchedPattern: "danger-srv",
+    });
+    const describeMcpTool = () =>
+      describeToolGate(
+        makeTcc({ toolName, input: { target: "prod" } }),
+        check,
+        makeFormatter(),
+      );
+
+    it("gates on the mcp surface with the target as the decision value", () => {
+      const desc = describeMcpTool();
+      expect(desc.surface).toBe("mcp");
+      expect(desc.decision).toEqual({ surface: "mcp", value: "danger-srv" });
+      expect(desc.promptDetails.accessIntent).toEqual({
+        surface: "mcp",
+        matchValues: ["danger-srv"],
+        boundaryValue: null,
+      });
+    });
+
+    it("approves exactly this tool for the session, on the mcp surface", () => {
+      const desc = describeMcpTool();
+      expect(desc.sessionApproval?.grants).toEqual([
+        { surface: "mcp", pattern: toolName },
+      ]);
+    });
+
+    it("keeps the invoked tool name and shows its arguments", () => {
+      const desc = describeMcpTool();
+      expect(desc.logContext.toolName).toBe(toolName);
+      expect(desc.logContext.toolInputPreview).toBe('input {"target":"prod"}');
+      expect(desc.payload.kind).toBe("mcp");
+      expect(desc.payload.request.value).toBe("danger-srv");
+      expect(desc.payload.evidence).toEqual([
+        { label: "input", text: 'with input {"target":"prod"}', detail: null },
+      ]);
+    });
   });
 
   it("carries the checked tool and its matched rule on the payload", () => {
@@ -333,6 +378,68 @@ describe("describeToolGate", () => {
       makeFormatter(),
     );
     expect(desc.promptDetails.accessIntent).toEqual({
+      surface: "bash",
+      matchValues: ["git status"],
+      boundaryValue: null,
+    });
+  });
+
+  it("carries the floor that raised a bash ask on promptDetails", () => {
+    const check = makeCheckResult("ask", {
+      toolName: "bash",
+      command: "sudo rm x",
+      matchedPattern: "<indirection-bash-wrapper>",
+      floor: "<indirection-bash-wrapper>",
+    });
+    const desc = describeToolGate(
+      makeTcc({ toolName: "bash", input: { command: "sudo rm x" } }),
+      check,
+      makeFormatter(),
+    );
+    expect(desc.promptDetails.accessIntent).toEqual({
+      surface: "bash",
+      matchValues: ["sudo rm x"],
+      boundaryValue: null,
+      floor: "<indirection-bash-wrapper>",
+    });
+  });
+
+  it("carries a bash chain's asking units on promptDetails", () => {
+    const check = makeCheckResult("ask", {
+      toolName: "bash",
+      command: "ls",
+      askingUnits: [
+        { command: "ls" },
+        { command: "sudo rm y", floor: "<indirection-bash-wrapper>" },
+      ],
+    });
+    const desc = describeToolGate(
+      makeTcc({ toolName: "bash", input: { command: "ls && sudo rm y" } }),
+      check,
+      makeFormatter(),
+    );
+    expect(desc.promptDetails.accessIntent).toStrictEqual({
+      surface: "bash",
+      matchValues: ["ls"],
+      boundaryValue: null,
+      askingUnits: [
+        { command: "ls" },
+        { command: "sudo rm y", floor: "<indirection-bash-wrapper>" },
+      ],
+    });
+  });
+
+  it("leaves the asking-units key off a bash ask that carries none", () => {
+    const check = makeCheckResult("ask", {
+      toolName: "bash",
+      command: "git status",
+    });
+    const desc = describeToolGate(
+      makeTcc({ toolName: "bash", input: { command: "git status" } }),
+      check,
+      makeFormatter(),
+    );
+    expect(desc.promptDetails.accessIntent).toStrictEqual({
       surface: "bash",
       matchValues: ["git status"],
       boundaryValue: null,

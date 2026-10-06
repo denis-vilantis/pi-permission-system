@@ -2,22 +2,18 @@
  * The tool-surface region of a system prompt: which tools this session may
  * call, and the guidance those tools contribute.
  *
- * Pi writes that region near the top of its preamble, a few hundred characters
- * in. `@gotgenes/pi-subagents` copies everything ahead of the skills catalogue
- * into a child's prompt verbatim, so the child's leading bytes match its
- * parent's for prefix-reusing inference engines — which means editing the
- * region in place ends that shared prefix for every child whose allowed set
- * differs from its parent's (#890).
+ * Pi renders that region itself, as its `<tools>` and `<rules>` sections, from
+ * the active tool set this extension narrows — but only when it writes the
+ * preamble. A subagent child's prompt is always a `customPrompt`, under which
+ * Pi writes neither section, so a child states its own through
+ * `systemPromptOptions.sections`, which Pi places after its `<cwd>` section.
+ * This module renders those section contents.
  *
- * So the region is *relocated* rather than narrowed: the sections Pi wrote are
- * removed wherever they sit, and this node's own are rendered at the end of
- * the prompt, past everything a child inherits. Each session then states its
- * own tool surface and no session edits another's bytes.
- *
- * Rendering follows `buildSystemPrompt`'s own rules — a tool is listed only
+ * Rendering follows `buildSystemPrompt`'s own rules: a tool is listed only
  * when it has a snippet, and the guideline bullets are the allowed tools' own
- * `promptGuidelines` around Pi's built-in ones — so the block reads as the one
- * Pi would have written for this session's real surface.
+ * `promptGuidelines`, then other extensions' rules, around Pi's built-in ones,
+ * so the sections read as the ones Pi would have written for this session's
+ * real surface.
  */
 
 /** What a session's tool surface renders from. */
@@ -28,23 +24,26 @@ export interface ToolSurfaceInputs {
   readonly toolSnippets: Readonly<Record<string, string>>;
   /** Guideline bullets each tool contributes, keyed by tool name. */
   readonly guidelinesByTool: ReadonlyMap<string, readonly string[]>;
+  /**
+   * `systemPromptOptions.promptGuidelines`: the bullets other extensions add
+   * to Pi's rules after the tools' own.
+   *
+   * Only a bullet no registered tool contributes is carried, so a denied
+   * tool's bullet cannot return by this route.
+   */
+  readonly promptGuidelines: readonly string[];
 }
 
-type LineSection = {
-  start: number;
-  end: number;
-};
-
-const AVAILABLE_TOOLS_SECTION_HEADER = "Available tools:";
-const GUIDELINES_SECTION_HEADER = "Guidelines:";
-
 /**
- * Pi's filler sentence between the tool list and the guidelines.
- *
- * It refers to "the tools above", so it belongs with the list rather than with
- * the text the list is being moved out of.
+ * This session's tool surface as the contents of Pi's `tools` and `rules`
+ * prompt sections, untagged: Pi wraps each `sections` entry in its own tags.
  */
-const CUSTOM_TOOLS_FILLER_PREFIX = "In addition to the tools above";
+export interface ToolSurfaceSections {
+  /** `- name: snippet` lines; absent when no allowed tool has a snippet. */
+  readonly tools?: string;
+  /** `- rule` lines, in `buildSystemPrompt`'s order. */
+  readonly rules: string;
+}
 
 /** Pi's two unconditional guideline bullets, in the order it writes them. */
 const UNIVERSAL_GUIDELINES: readonly string[] = [
@@ -53,93 +52,42 @@ const UNIVERSAL_GUIDELINES: readonly string[] = [
 ];
 
 /**
- * Relocate the tool surface: drop the sections Pi wrote, append this session's.
+ * Render this session's tool surface as section contents, for a node that
+ * states it through `systemPromptOptions.sections`.
  *
- * The result always carries a tool-surface block, so a child whose inherited
- * identity has none — its parent's node having already relocated it — still
- * describes its own tools.
+ * The `tools` section is omitted when no allowed tool has a snippet, as Pi
+ * lists a tool only when it has one.
  */
-export function renderToolSurface(
-  systemPrompt: string,
+export function renderToolSurfaceSections(
   inputs: ToolSurfaceInputs,
-): string {
-  const lines = removeToolSurfaceSections(
-    normalizePrompt(systemPrompt).split("\n"),
-  );
-  const body = collapseExtraBlankLines(lines.join("\n"));
-  const block = renderToolSurfaceBlock(inputs);
-
-  return body.length > 0 ? `${body}\n\n${block}` : block;
+): ToolSurfaceSections {
+  const tools = toolBullets(inputs);
+  const rules = ruleBullets(inputs).join("\n");
+  return tools.length > 0 ? { tools: tools.join("\n"), rules } : { rules };
 }
 
 /**
- * Remove the `Available tools:` and `Guidelines:` sections, and the filler
- * sentence between them.
- *
- * Each section is located by its own header, so the two are removed whether
- * they sit adjacent in Pi's preamble or alone in a prompt something downstream
- * rewrote — including a prompt this function already produced, which is what
- * makes it safe to apply to its own output.
- */
-function removeToolSurfaceSections(lines: readonly string[]): string[] {
-  let remaining = [...lines];
-  for (const header of [
-    AVAILABLE_TOOLS_SECTION_HEADER,
-    GUIDELINES_SECTION_HEADER,
-  ]) {
-    const section = findSection(remaining, header);
-    if (section) {
-      remaining = [
-        ...remaining.slice(0, section.start),
-        ...remaining.slice(section.end),
-      ];
-    }
-  }
-
-  return remaining.filter(
-    (line) => !line.trimStart().startsWith(CUSTOM_TOOLS_FILLER_PREFIX),
-  );
-}
-
-/** This session's tool surface, as Pi would have rendered it. */
-function renderToolSurfaceBlock(inputs: ToolSurfaceInputs): string {
-  const sections: string[] = [];
-
-  const toolList = renderAvailableTools(inputs);
-  if (toolList) {
-    sections.push(toolList);
-  }
-  sections.push(renderGuidelines(inputs));
-
-  return sections.join("\n\n");
-}
-
-/**
- * The `Available tools:` section for the allowed set, or `null` when none of
- * those tools has a snippet.
+ * One bullet per allowed tool that has a snippet.
  *
  * Pi lists a tool only when the caller supplied a one-line snippet for it, so
  * a tool without one is left unlisted here too rather than rendered bare.
  */
-function renderAvailableTools(inputs: ToolSurfaceInputs): string | null {
-  const bullets = inputs.allowedTools
+function toolBullets(inputs: ToolSurfaceInputs): string[] {
+  return inputs.allowedTools
     .map((toolName) => ({ toolName, snippet: inputs.toolSnippets[toolName] }))
     .filter((tool) => Boolean(tool.snippet))
     .map((tool) => `- ${tool.toolName}: ${tool.snippet}`);
-
-  return bullets.length > 0
-    ? [AVAILABLE_TOOLS_SECTION_HEADER, ...bullets].join("\n")
-    : null;
 }
 
 /**
- * The `Guidelines:` section for the allowed set.
+ * The guideline bullets for the allowed set.
  *
  * Mirrors `buildSystemPrompt`'s assembly: its conditional file-exploration
- * bullet first, then each allowed tool's own contributions, then its two
- * unconditional bullets — de-duplicated in first-seen order, as Pi does.
+ * bullet first, then each allowed tool's own contributions, then the bullets
+ * other extensions added, then its two unconditional bullets — de-duplicated
+ * in first-seen order, as Pi does.
  */
-function renderGuidelines(inputs: ToolSurfaceInputs): string {
+function ruleBullets(inputs: ToolSurfaceInputs): string[] {
   const bullets: string[] = [];
   const seen = new Set<string>();
   const addGuideline = (guideline: string): void => {
@@ -162,14 +110,27 @@ function renderGuidelines(inputs: ToolSurfaceInputs): string {
     }
   }
 
+  for (const guideline of extensionGuidelines(inputs)) {
+    addGuideline(guideline);
+  }
+
   for (const guideline of UNIVERSAL_GUIDELINES) {
     addGuideline(guideline);
   }
 
-  return [
-    GUIDELINES_SECTION_HEADER,
-    ...bullets.map((bullet) => `- ${bullet}`),
-  ].join("\n");
+  return bullets.map((bullet) => `- ${bullet}`);
+}
+
+/** The `promptGuidelines` bullets no registered tool contributes. */
+function extensionGuidelines(inputs: ToolSurfaceInputs): string[] {
+  const toolGuidelines = new Set(
+    [...inputs.guidelinesByTool.values()]
+      .flat()
+      .map((guideline) => guideline.trim()),
+  );
+  return inputs.promptGuidelines.filter(
+    (guideline) => !toolGuidelines.has(guideline.trim()),
+  );
 }
 
 /**
@@ -199,60 +160,4 @@ function fileExplorationGuideline(
     return "Use PowerShell for file operations like listing, searching, and finding files";
   }
   return "Use bash for file operations like ls, rg, find";
-}
-
-function normalizePrompt(prompt: string): string {
-  return (prompt || "").replace(/\r\n/g, "\n");
-}
-
-function collapseExtraBlankLines(text: string): string {
-  return text.replace(/\n{3,}/g, "\n\n").trimEnd();
-}
-
-function isTopLevelSectionHeader(line: string): boolean {
-  const trimmed = line.trim();
-  return (
-    trimmed.length > 0 && trimmed.endsWith(":") && !trimmed.startsWith("-")
-  );
-}
-
-function isSectionBodyLine(line: string): boolean {
-  const trimmed = line.trim();
-  if (trimmed.length === 0) return true; // blank line
-  if (trimmed.startsWith("- ")) return true; // bullet
-  if (line !== line.trimStart()) return true; // indented
-  return false;
-}
-
-function findSection(
-  lines: readonly string[],
-  header: string,
-): LineSection | null {
-  const start = lines.findIndex((line) => line.trim() === header);
-  if (start === -1) {
-    return null;
-  }
-
-  // If a subsequent recognised section header exists, use it as the boundary.
-  // This preserves the original behaviour for the common case where sections
-  // are adjacent (e.g. "Available tools:" followed by "Guidelines:") and
-  // ensures any prose continuation between the two headers is also removed.
-  for (let index = start + 1; index < lines.length; index += 1) {
-    if (isTopLevelSectionHeader(lines[index])) {
-      return { start, end: index };
-    }
-  }
-
-  // No subsequent section header — stop at the first non-body line so that
-  // content after the section (e.g. custom user notes) is not silently deleted.
-  let end = start + 1;
-  for (let index = start + 1; index < lines.length; index += 1) {
-    if (!isSectionBodyLine(lines[index])) {
-      end = index;
-      break;
-    }
-    end = index + 1;
-  }
-
-  return { start, end };
 }

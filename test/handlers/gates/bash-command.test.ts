@@ -1,10 +1,21 @@
-import { describe, expect, it } from "vitest";
+import { homedir } from "node:os";
+import { beforeAll, describe, expect, it } from "vitest";
 
+import { warmBashParser } from "#src/access-intent/bash/parser";
+import { type BashCommand, BashProgram } from "#src/access-intent/bash/program";
 import { resolveBashCommandCheck } from "#src/handlers/gates/bash-command";
-import type { PermissionCheckResult } from "#src/types";
+import { pathFlavorForPlatform } from "#src/path/path-flavor";
+import { PathNormalizer } from "#src/path/path-normalizer";
+import { PermissionResolver } from "#src/policy/permission-resolver";
+import type { Ruleset } from "#src/policy/rule";
+import type { PermissionCheckResult, PermissionState } from "#src/types";
 
-import { makeResolver } from "#test/helpers/gate-fixtures";
+import { bashCommandOf, makeResolver } from "#test/helpers/gate-fixtures";
 import { makeCheckResult } from "#test/helpers/handler-fixtures";
+import {
+  createInMemoryManager,
+  sessionRule,
+} from "#test/helpers/manager-harness";
 
 /** Build a bash-surface check result for a single command unit. */
 function bashResult(
@@ -31,9 +42,10 @@ describe("resolveBashCommandCheck", () => {
     expect(result.state).toBe("allow");
     expect(resolver.resolve).toHaveBeenCalledTimes(1);
     expect(resolver.resolve).toHaveBeenCalledWith({
-      kind: "tool",
+      kind: "bash-command",
       surface: "bash",
-      input: { command: "npm install pkg" },
+      command: "npm install pkg",
+      spellings: [],
       agentName: undefined,
     });
   });
@@ -41,7 +53,7 @@ describe("resolveBashCommandCheck", () => {
   it("denies the chain when any sub-command is denied, reporting that command's pattern", () => {
     const resolver = makeResolver();
     resolver.resolve.mockImplementation((intent) => {
-      const command = (intent as { input: { command: string } }).input.command;
+      const command = bashCommandOf(intent) ?? "";
       return command.startsWith("npm")
         ? bashResult("deny", command, "npm *")
         : bashResult("allow", command, "cd *");
@@ -62,7 +74,7 @@ describe("resolveBashCommandCheck", () => {
   it("asks when a sub-command asks and none denies", () => {
     const resolver = makeResolver();
     resolver.resolve.mockImplementation((intent) => {
-      const command = (intent as { input: { command: string } }).input.command;
+      const command = bashCommandOf(intent) ?? "";
       return command.startsWith("git")
         ? bashResult("ask", command, "git *")
         : bashResult("allow", command, "cd *");
@@ -83,7 +95,7 @@ describe("resolveBashCommandCheck", () => {
   it("returns the first allow result when every sub-command is allowed", () => {
     const resolver = makeResolver();
     resolver.resolve.mockImplementation((intent) => {
-      const command = (intent as { input: { command: string } }).input.command;
+      const command = bashCommandOf(intent) ?? "";
       return bashResult("allow", command, `${command} *`);
     });
 
@@ -111,9 +123,10 @@ describe("resolveBashCommandCheck", () => {
     expect(result.state).toBe("allow");
     expect(resolver.resolve).toHaveBeenCalledTimes(1);
     expect(resolver.resolve).toHaveBeenCalledWith({
-      kind: "tool",
+      kind: "bash-command",
       surface: "bash",
-      input: { command: "# just a comment" },
+      command: "# just a comment",
+      spellings: [],
       agentName: undefined,
     });
   });
@@ -140,9 +153,10 @@ describe("resolveBashCommandCheck", () => {
     // The whole command is resolved once, to see whether a deny rule covers it.
     expect(resolver.resolve).toHaveBeenCalledTimes(1);
     expect(resolver.resolve).toHaveBeenCalledWith({
-      kind: "tool",
+      kind: "bash-command",
       surface: "bash",
-      input: { command: "( rm x )" },
+      command: "( rm x )",
+      spellings: [],
       agentName: undefined,
     });
   });
@@ -164,9 +178,10 @@ describe("resolveBashCommandCheck", () => {
     resolveBashCommandCheck("npm i", [{ text: "npm i" }], "agent-x", resolver);
 
     expect(resolver.resolve).toHaveBeenCalledWith({
-      kind: "tool",
+      kind: "bash-command",
       surface: "bash",
-      input: { command: "npm i" },
+      command: "npm i",
+      spellings: [],
       agentName: "agent-x",
     });
   });
@@ -174,7 +189,7 @@ describe("resolveBashCommandCheck", () => {
   it("tags the winning result with the offending command's execution context", () => {
     const resolver = makeResolver();
     resolver.resolve.mockImplementation((intent) => {
-      const command = (intent as { input: { command: string } }).input.command;
+      const command = bashCommandOf(intent) ?? "";
       return command.startsWith("rm")
         ? bashResult("deny", command, "rm *")
         : bashResult("allow", command, "echo *");
@@ -378,7 +393,7 @@ describe("resolveBashCommandCheck", () => {
     ) {
       const resolver = makeResolver();
       resolver.resolve.mockImplementation((intent) => {
-        const { command } = (intent as { input: { command: string } }).input;
+        const command = bashCommandOf(intent) ?? "";
         return answers[command] ?? bashResult(fallbackState, command, "*");
       });
       return resolver;
@@ -534,9 +549,10 @@ describe("resolveBashCommandCheck", () => {
       );
 
       expect(resolver.resolve).toHaveBeenCalledWith({
-        kind: "tool",
+        kind: "bash-command",
         surface: "bash",
-        input: { command: "grep -l foo" },
+        command: "grep -l foo",
+        spellings: [],
         agentName: "reviewer",
       });
     });
@@ -681,3 +697,476 @@ describe("resolveBashCommandCheck", () => {
     });
   });
 });
+
+describe("resolveBashCommandCheck: a command unit's spellings", () => {
+  it("passes a unit's spellings with its typed text in one bash-command intent", () => {
+    const resolver = makeResolver(bashResult("allow", "~/bin/x"));
+
+    resolveBashCommandCheck(
+      "~/bin/x",
+      [{ text: "~/bin/x", spellings: ["/h/bin/x"] }],
+      "agent-x",
+      resolver,
+    );
+
+    expect(resolver.resolve).toHaveBeenCalledWith({
+      kind: "bash-command",
+      surface: "bash",
+      command: "~/bin/x",
+      spellings: ["/h/bin/x"],
+      agentName: "agent-x",
+    });
+  });
+
+  it("resolves the whole command of a salvaged-only parse with no spellings, since no unit owns it", () => {
+    const resolver = makeResolver(bashResult("ask", "~/bin/x <<", "*"));
+
+    resolveBashCommandCheck(
+      "~/bin/x <<",
+      [
+        {
+          text: "~/bin/x",
+          spellings: ["/h/bin/x"],
+          parseUnresolved: true,
+          salvaged: true,
+        },
+      ],
+      undefined,
+      resolver,
+    );
+
+    expect(resolver.resolve).toHaveBeenCalledWith({
+      kind: "bash-command",
+      surface: "bash",
+      command: "~/bin/x <<",
+      spellings: [],
+      agentName: undefined,
+    });
+  });
+});
+
+/**
+ * The reported scenarios, end to end over the real parse, the real manager, and
+ * the real resolver: a bash rule written with a home prefix against a command
+ * typed with one.
+ */
+describe("resolveBashCommandCheck: home-prefixed rules and commands", () => {
+  const home = homedir();
+
+  beforeAll(async () => {
+    await warmBashParser();
+  });
+
+  function decide(
+    bash: Record<string, PermissionState>,
+    command: string,
+    sessionGrants: Ruleset = [],
+  ): PermissionCheckResult {
+    const manager = createInMemoryManager({
+      global: { permission: { bash } },
+    });
+    const resolver = new PermissionResolver(manager, {
+      getRuleset: () => sessionGrants,
+    });
+    const units = commandsOf(command);
+    if (units === null) throw new Error("parser not warm");
+    return resolveBashCommandCheck(command, units, undefined, resolver);
+  }
+
+  describe("a rule written with ~ matches the command however its home is spelled", () => {
+    it.each([
+      "~/.pi/agent/bin/memory-index",
+      "$HOME/.pi/agent/bin/memory-index",
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: a braced shell expansion, not a template string
+      "${HOME}/.pi/agent/bin/memory-index",
+      `${home}/.pi/agent/bin/memory-index`,
+    ])("%s", (command) => {
+      const result = decide(
+        { "*": "ask", "~/.pi/agent/bin/memory-index": "allow" },
+        command,
+      );
+      expect(result.state).toBe("allow");
+      expect(result.matchedPattern).toBe("~/.pi/agent/bin/memory-index");
+      expect(result.command).toBe(command);
+    });
+  });
+
+  it("matches a rule written with the absolute home against a command typed with ~", () => {
+    const result = decide(
+      { "*": "ask", [`${home}/.pi/agent/bin/memory-index`]: "allow" },
+      "~/.pi/agent/bin/memory-index",
+    );
+    expect(result.state).toBe("allow");
+  });
+
+  it("denies a command typed with ~ that a home-anchored deny names", () => {
+    const result = decide(
+      { "*": "allow", "~/bin/danger *": "deny" },
+      "~/bin/danger --now",
+    );
+    expect(result.state).toBe("deny");
+    expect(result.matchedPattern).toBe("~/bin/danger *");
+    expect(result.command).toBe("~/bin/danger --now");
+  });
+
+  it("honors a session grant recorded for a command typed with ~", () => {
+    const result = decide({ "*": "ask" }, "~/.pi/agent/bin/memory-index", [
+      sessionRule("bash", "~/.pi/agent/bin/memory-index"),
+    ]);
+    expect(result.state).toBe("allow");
+    expect(result.source).toBe("session");
+  });
+
+  it("keeps asking once the program rebinds HOME", () => {
+    const result = decide(
+      { "*": "ask", "~/bin/tool": "allow" },
+      "HOME=/tmp/evil; ~/bin/tool",
+    );
+    expect(result.state).toBe("ask");
+    expect(result.matchedPattern).toBe("*");
+  });
+
+  it("matches an argument as typed, as before", () => {
+    expect(
+      decide({ "*": "ask", "cat ~/notes": "allow" }, "cat ~/notes").state,
+    ).toBe("allow");
+    expect(
+      decide({ "*": "ask", "cat ~/notes": "allow" }, `cat ${home}/notes`).state,
+    ).toBe("ask");
+  });
+
+  it("still floors a wrapper whose wrapped command a home-anchored rule allows", () => {
+    const result = decide({ "*": "allow", "~/bin/*": "allow" }, "sudo ~/bin/x");
+    expect(result.state).toBe("ask");
+    expect(result.matchedPattern).toBe("<indirection-bash-wrapper>");
+  });
+});
+
+/**
+ * The reported scenarios, end to end over the real parse, the real manager, and
+ * the real resolver: a bash rule naming a path in its absolute spelling against
+ * a command naming it relatively.
+ */
+describe("resolveBashCommandCheck: a rule written with an absolute path", () => {
+  const cwd = process.cwd();
+
+  beforeAll(async () => {
+    await warmBashParser();
+  });
+
+  describe("matches the relative spelling of that path", () => {
+    it("allowing it when the absolute allow comes after the broader ask", () => {
+      const result = decide(
+        { "*": "allow", "rm *": "ask", "rm /tmp/agent-builds/*": "allow" },
+        "cd /tmp && rm agent-builds/pi-permission-system/config.json",
+      );
+      // Every unit allows, so the chain reports its first (`cd /tmp`); the
+      // `rm` unit alone would ask via `rm *` without its absolute spelling.
+      expect(result.state).toBe("allow");
+    });
+
+    it("denying it after a cd", () => {
+      const result = decide(
+        { "*": "allow", "rm /tmp/agent-builds/*": "deny" },
+        "cd /tmp && rm agent-builds/x",
+      );
+      expect(result.state).toBe("deny");
+      expect(result.matchedPattern).toBe("rm /tmp/agent-builds/*");
+    });
+
+    it("denying it inside the working directory", () => {
+      const result = decide(
+        { "*": "allow", [`rm ${cwd}/secrets/*`]: "deny" },
+        "rm secrets/x",
+      );
+      expect(result.state).toBe("deny");
+      expect(result.command).toBe("rm secrets/x");
+      expect(result.matchedSpelling).toBe(`rm ${cwd}/secrets/x`);
+    });
+
+    it("with a parent segment resolved to the file that runs", () => {
+      const result = decide(
+        { "*": "allow", "rm /etc/*": "deny" },
+        "cd /tmp/a && rm ../../etc/x",
+      );
+      expect(result.state).toBe("deny");
+    });
+
+    it("for a quoted argument", () => {
+      const result = decide(
+        { "*": "allow", "rm /tmp/a b/*": "deny" },
+        'cd /tmp && rm "a b/c"',
+      );
+      expect(result.state).toBe("deny");
+    });
+
+    it("for a command nested in a substitution", () => {
+      const result = decide(
+        { "*": "allow", "cat /tmp/a/*": "deny" },
+        "cd /tmp && echo $(cat a/x)",
+      );
+      expect(result.state).toBe("deny");
+      expect(result.command).toBe("cat a/x");
+    });
+
+    it("and a wrapper unit it allows still floors to ask", () => {
+      const result = decide(
+        { "*": "ask", "cd *": "allow", "sudo rm /tmp/a/*": "allow" },
+        "cd /tmp && sudo rm a/x",
+      );
+      expect(result.state).toBe("ask");
+      expect(result.matchedPattern).toBe("<indirection-bash-wrapper>");
+      // The floor replaced the rule the spelling matched, so the spelling no
+      // longer names what decided.
+      expect("matchedSpelling" in result).toBe(false);
+    });
+  });
+
+  describe("leaves the decision to the typed text", () => {
+    it("when the absolute allow comes before the broader ask", () => {
+      const result = decide(
+        { "*": "allow", "rm /tmp/agent-builds/*": "allow", "rm *": "ask" },
+        "cd /tmp && rm agent-builds/x",
+      );
+      expect(result.state).toBe("ask");
+      expect(result.matchedPattern).toBe("rm *");
+    });
+
+    it("after a cd whose target is not literal", () => {
+      const result = decide(
+        { "*": "allow", "rm *": "ask", "rm /tmp/agent-builds/*": "allow" },
+        'cd "$DIR" && rm agent-builds/x',
+      );
+      expect(result.state).toBe("ask");
+      expect(result.matchedPattern).toBe("rm *");
+    });
+
+    it("for an argument a variable computes", () => {
+      const result = decide(
+        { "*": "ask", [`rm ${cwd}/*`]: "allow" },
+        "rm $DIR/x",
+      );
+      expect(result.state).toBe("ask");
+      expect(result.matchedPattern).toBe("*");
+    });
+
+    it("for an argument a substitution computes", () => {
+      const result = decide(
+        { "*": "allow", [`cat ${cwd}/*`]: "deny" },
+        "cat $(pwd)/x",
+      );
+      expect(result.state).toBe("allow");
+    });
+  });
+});
+
+describe("resolveBashCommandCheck: the floor that raised an ask", () => {
+  beforeAll(async () => {
+    await warmBashParser();
+  });
+
+  describe("a floored ask names its floor", () => {
+    it.each([
+      ["sudo rm x", "<indirection-bash-wrapper>"],
+      ["bash -c 'rm x'", "<opaque-bash-wrapper>"],
+    ])("%s", (command, sentinel) => {
+      const result = decide({ "*": "allow" }, command);
+      expect(result.state).toBe("ask");
+      expect(result.matchedPattern).toBe(sentinel);
+      expect(result.floor).toBe(sentinel);
+    });
+
+    it("a unit the parse could not resolve", () => {
+      const result = resolveBashCommandCheck(
+        "rm x (",
+        [{ text: "rm x", parseUnresolved: true }],
+        undefined,
+        resolverOver({ "*": "allow" }),
+      );
+      expect(result.state).toBe("ask");
+      expect(result.matchedPattern).toBe("<unparsed-bash-subtree>");
+      expect(result.floor).toBe("<unparsed-bash-subtree>");
+    });
+
+    it("a command the parse matched nothing in", () => {
+      const result = resolveBashCommandCheck(
+        "( rm x )",
+        [],
+        undefined,
+        resolverOver({ "*": "allow" }),
+      );
+      expect(result.state).toBe("ask");
+      expect(result.matchedPattern).toBe("<unparseable-bash-command>");
+      expect(result.floor).toBe("<unparseable-bash-command>");
+    });
+  });
+
+  describe("a chain carries a floor raised on a unit that did not win", () => {
+    it("stamps the floored unit's sentinel on the rule-asking winner", () => {
+      const result = decide(
+        { "*": "allow", "git push *": "ask" },
+        "git push origin main && sudo rm x",
+      );
+      expect(result.state).toBe("ask");
+      expect(result.command).toBe("git push origin main");
+      expect(result.matchedPattern).toBe("git push *");
+      expect(result.floor).toBe("<indirection-bash-wrapper>");
+    });
+
+    it("leaves out a floored unit the session already granted", () => {
+      const result = decide(
+        { "*": "allow", "git push *": "ask" },
+        "git push origin main && sudo rm x",
+        [sessionRule("bash", "sudo rm x")],
+      );
+      expect(result.state).toBe("ask");
+      expect(result.command).toBe("git push origin main");
+      expect(result.floor).toBeUndefined();
+    });
+  });
+
+  describe("no floor raised", () => {
+    it("a deny winner carries none, even beside a floored unit", () => {
+      const result = decide(
+        { "*": "allow", "rm *": "deny" },
+        "sudo touch y && rm x",
+      );
+      expect(result.state).toBe("deny");
+      expect(result.floor).toBeUndefined();
+    });
+
+    it("an execution-modifier wrapper resolved by its inner command", () => {
+      const result = decide({ "*": "allow", "rm *": "ask" }, "time rm x");
+      expect(result.state).toBe("ask");
+      expect(result.matchedPattern).toBe("rm *");
+      expect(result.floor).toBeUndefined();
+    });
+
+    it("a plain rule ask", () => {
+      const result = decide({ "*": "ask" }, "rm x");
+      expect(result.state).toBe("ask");
+      expect(result.floor).toBeUndefined();
+    });
+  });
+});
+
+describe("resolveBashCommandCheck: the units a chain leaves asking", () => {
+  beforeAll(async () => {
+    await warmBashParser();
+  });
+
+  describe("an asking chain lists every unit it could not resolve", () => {
+    it("lists each rule-asking unit in chain order", () => {
+      const result = decide({ "*": "ask" }, "ls && rm -rf /tmp/x");
+      expect(result.askingUnits).toStrictEqual([
+        { command: "ls" },
+        { command: "rm -rf /tmp/x" },
+      ]);
+    });
+
+    it("leaves out a unit the child's own rule allowed", () => {
+      const result = decide(
+        { "*": "ask", "ls*": "allow" },
+        "ls && rm -rf /tmp/x",
+      );
+      expect(result.askingUnits).toStrictEqual([{ command: "rm -rf /tmp/x" }]);
+    });
+
+    it("names each unit's own floor", () => {
+      const result = decide(
+        { "*": "allow", "git push *": "ask" },
+        "git push origin main && sudo rm y",
+      );
+      expect(result.askingUnits).toStrictEqual([
+        { command: "git push origin main" },
+        { command: "sudo rm y", floor: "<indirection-bash-wrapper>" },
+      ]);
+    });
+
+    it("leaves out a unit the session already granted", () => {
+      const result = decide(
+        { "*": "allow", "git push *": "ask" },
+        "git push origin main && sudo rm y",
+        [sessionRule("bash", "sudo rm y")],
+      );
+      expect(result.askingUnits).toStrictEqual([
+        { command: "git push origin main" },
+      ]);
+    });
+
+    it("names an unresolved subtree by the whole command", () => {
+      const result = resolveBashCommandCheck(
+        "rm x (",
+        [{ text: "rm x", parseUnresolved: true }],
+        undefined,
+        resolverOver({ "*": "allow" }),
+      );
+      expect(result.askingUnits).toStrictEqual([
+        { command: "rm x (", floor: "<unparsed-bash-subtree>" },
+      ]);
+    });
+  });
+
+  describe("no units listed", () => {
+    it("a deny winner, even beside a floored unit", () => {
+      const result = decide(
+        { "*": "allow", "rm *": "deny" },
+        "sudo touch y && rm x",
+      );
+      expect(result.state).toBe("deny");
+      expect(result).not.toHaveProperty("askingUnits");
+    });
+
+    it("an all-allow chain", () => {
+      const result = decide({ "*": "allow" }, "ls && rm x");
+      expect(result.state).toBe("allow");
+      expect(result).not.toHaveProperty("askingUnits");
+    });
+
+    it("a command the parse matched nothing in", () => {
+      const result = resolveBashCommandCheck(
+        "( rm x )",
+        [],
+        undefined,
+        resolverOver({ "*": "allow" }),
+      );
+      expect(result.state).toBe("ask");
+      expect(result).not.toHaveProperty("askingUnits");
+    });
+  });
+});
+
+function resolverOver(
+  bash: Record<string, PermissionState>,
+  sessionGrants: Ruleset = [],
+): PermissionResolver {
+  return new PermissionResolver(
+    createInMemoryManager({ global: { permission: { bash } } }),
+    { getRuleset: () => sessionGrants },
+  );
+}
+
+function decide(
+  bash: Record<string, PermissionState>,
+  command: string,
+  sessionGrants: Ruleset = [],
+): PermissionCheckResult {
+  const units = commandsOf(command);
+  if (units === null) throw new Error("parser not warm");
+  return resolveBashCommandCheck(
+    command,
+    units,
+    undefined,
+    resolverOver(bash, sessionGrants),
+  );
+}
+
+const normalizer = new PathNormalizer(
+  pathFlavorForPlatform(process.platform),
+  process.cwd(),
+);
+
+/** The units the synchronous parse enumerates, or `null` while cold. */
+function commandsOf(command: string): BashCommand[] | null {
+  return BashProgram.parseSync(command, normalizer)?.commands() ?? null;
+}

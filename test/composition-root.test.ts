@@ -17,18 +17,20 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import {
   createEventBus,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { unregisteredLinkMessage } from "#src/authority/authorizer-chain-audit";
 import { childNodeAbsentMessage } from "#src/authority/child-node-audit";
 import {
   createPermissionForwardingLocation,
@@ -47,6 +49,7 @@ import {
   REVIEW_LOG_FILENAME,
 } from "#src/config/config-paths";
 import { DEFAULT_EXTENSION_CONFIG } from "#src/config/extension-config";
+import { SESSION_ENDED_REASON } from "#src/handlers/lifecycle";
 import piPermissionSystemExtension from "#src/index";
 import { getPermissionsService } from "#src/service";
 import {
@@ -54,6 +57,7 @@ import {
   type PermissionsReadyEvent,
 } from "#src/service/permission-events";
 import { publishServingHeartbeat } from "#test/helpers/forwarding-fixtures";
+import { makePromptOptions } from "#test/helpers/handler-fixtures";
 import { makeFakePi } from "#test/helpers/make-fake-pi";
 
 const SUBAGENT_REGISTRY_KEY = Symbol.for(
@@ -152,6 +156,7 @@ function makeBaseCtx(
     select?: CtxSelect;
     notify?: CtxNotify;
     isProjectTrusted?: boolean;
+    sessionName?: string;
   } = {},
 ): unknown {
   const trusted = options.isProjectTrusted ?? true;
@@ -163,6 +168,7 @@ function makeBaseCtx(
       getEntries: (): unknown[] => [],
       getSessionId: (): string => sessionId,
       getSessionDir: (): string => cwd,
+      getSessionName: (): string | undefined => options.sessionName,
     },
     ui: {
       notify: options.notify ?? ((): void => {}),
@@ -348,6 +354,98 @@ describe("subagent registry sharing across factory instances", () => {
     rmSync(externalDir, { recursive: true, force: true });
   });
 
+  it("forwards the floor that raised a child's bash ask", async () => {
+    writeGlobalConfig({ permission: { "*": "allow" } });
+
+    const childCwd = mkdtempSync(join(tmpdir(), "pi-perm-child-cwd-"));
+    const forwardingDir = join(agentDir, "sessions", "permission-forwarding");
+    const parentSessionId = "parent-session-floor";
+    const childSessionId = "child-session-floor";
+
+    const parentBus = createEventBus();
+    const childBus = createEventBus();
+    piPermissionSystemExtension(
+      makeFakePi({ events: parentBus }) as unknown as ExtensionAPI,
+    );
+    const childPi = makeFakePi({ events: childBus, toolNames: ["bash"] });
+    piPermissionSystemExtension(childPi as unknown as ExtensionAPI);
+    parentBus.emit(SUBAGENT_CHILD_SESSION_CREATED, {
+      sessionId: childSessionId,
+      parentSessionId,
+    });
+    getServingSessionRegistry().markServing(parentSessionId);
+
+    // Under a `*` allow the wrapper floor alone raises this ask; the parent
+    // cannot recompute it, so it has to ride the request.
+    const firePromise = childPi.fire(
+      "tool_call",
+      {
+        toolName: "bash",
+        toolCallId: "child-floored-bash",
+        input: { command: "sudo rm x" },
+      },
+      makeChildCtx(childCwd, childSessionId),
+    );
+
+    const request = await approveForwardedRequest(
+      forwardingDir,
+      parentSessionId,
+    );
+    expect(request.accessIntent?.surface).toBe("bash");
+    expect(request.accessIntent?.matchValues).toEqual(["sudo rm x"]);
+    expect(request.accessIntent?.floor).toBe("<indirection-bash-wrapper>");
+
+    await firePromise;
+    rmSync(childCwd, { recursive: true, force: true });
+  });
+
+  it("forwards every unit a child's bash chain left asking", async () => {
+    writeGlobalConfig({ permission: { "*": "allow", bash: { "*": "ask" } } });
+
+    const childCwd = mkdtempSync(join(tmpdir(), "pi-perm-child-cwd-"));
+    const forwardingDir = join(agentDir, "sessions", "permission-forwarding");
+    const parentSessionId = "parent-session-units";
+    const childSessionId = "child-session-units";
+
+    const parentBus = createEventBus();
+    const childBus = createEventBus();
+    piPermissionSystemExtension(
+      makeFakePi({ events: parentBus }) as unknown as ExtensionAPI,
+    );
+    const childPi = makeFakePi({ events: childBus, toolNames: ["bash"] });
+    piPermissionSystemExtension(childPi as unknown as ExtensionAPI);
+    parentBus.emit(SUBAGENT_CHILD_SESSION_CREATED, {
+      sessionId: childSessionId,
+      parentSessionId,
+    });
+    getServingSessionRegistry().markServing(parentSessionId);
+
+    // The parent's answer approves the whole line, so it has to see every
+    // command the child left asking, not only the winner.
+    const firePromise = childPi.fire(
+      "tool_call",
+      {
+        toolName: "bash",
+        toolCallId: "child-chain-bash",
+        input: { command: "ls && rm -rf /tmp/x" },
+      },
+      makeChildCtx(childCwd, childSessionId),
+    );
+
+    const request = await approveForwardedRequest(
+      forwardingDir,
+      parentSessionId,
+    );
+    expect(request.accessIntent?.matchValues).toEqual(["ls"]);
+    expect(request.accessIntent?.askingUnits).toStrictEqual([
+      { command: "ls" },
+      { command: "rm -rf /tmp/x" },
+    ]);
+
+    await firePromise;
+    rmSync(childCwd, { recursive: true, force: true });
+  });
+
   // The #719 failure mode: the child forwards correctly, but nothing drains
   // the parent's inbox. Before the serving registry it waited out the full
   // ten-minute timeout and reported the block as a user denial.
@@ -528,7 +626,10 @@ describe("interactive serving eligibility", () => {
     vi.stubEnv("PI_SUBAGENT_PARENT_SESSION", markerValue);
     await pi.fire(
       "before_agent_start",
-      { systemPrompt: "", systemPromptOptions: { cwd: "/test" } },
+      {
+        systemPrompt: "",
+        systemPromptOptions: makePromptOptions({ cwd: "/test" }),
+      },
       ctx,
     );
 
@@ -733,6 +834,38 @@ describe("shutdown teardown chain", () => {
       parentSessionId: "p-late",
     });
     expect(getSubagentSessionRegistry().has("late-child")).toBe(false);
+
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("answers an unanswered ask when the session ends", async () => {
+    writeGlobalConfig({ permission: { "*": "allow", demo: "ask" } });
+
+    const cwd = mkdtempSync(join(tmpdir(), "pi-perm-release-cwd-"));
+    const pi = makeFakePi({ toolNames: ["demo"] });
+    piPermissionSystemExtension(pi as unknown as ExtensionAPI);
+
+    // A human who never answers: the dialog stays open until the session ends.
+    const ctx = makeBaseCtx(cwd, "ui-session", {
+      select: () => new Promise<string | undefined>(() => undefined),
+    });
+    await fireSessionStart(pi, ctx);
+
+    const gated = pi.fire(
+      "tool_call",
+      { toolName: "demo", toolCallId: "demo-unanswered", input: {} },
+      ctx,
+    ) as Promise<{ block?: true; reason?: string }>;
+    await sleep(10);
+
+    await pi.fire("session_shutdown");
+
+    const result = await gated;
+    expect(result.block).toBe(true);
+    expect(result.reason).toContain(SESSION_ENDED_REASON);
+    // A user who was never asked denied nothing (#719): the refusal must not
+    // render through `renderUserDenial`.
+    expect(result.reason).not.toContain("The user denied");
 
     rmSync(cwd, { recursive: true, force: true });
   });
@@ -988,8 +1121,8 @@ describe("fact-shaping inheritance stops at live authority", () => {
   // A link returns a verdict, so live authority converges at the adjudicating
   // node (ADR 0007 §7) and inheriting one would run authority the operator's
   // own exclusion removed. That a configured-but-absent link is skipped here
-  // rather than borrowed is deliberate; whether the skip should be louder is
-  // its own question, tracked as #861.
+  // rather than borrowed is deliberate — and since #861 the skip is no longer
+  // silent: the operator answering the ask is told once per configured name.
   it("does not resolve an authorizer registered only in the parent", async () => {
     writeGlobalConfig({
       permission: { "*": "ask" },
@@ -1026,11 +1159,13 @@ describe("fact-shaping inheritance stops at live authority", () => {
     // The child has UI and no serving parent, so it adjudicates locally and its
     // own chain runs — the one shape in which a missing link changes the verdict.
     const capturedTitles: string[] = [];
+    const notified: string[] = [];
     const childCtx = makeBaseCtx(childCwd, childSessionId, {
       select: async (title: string): Promise<string | undefined> => {
         capturedTitles.push(title);
         return "Yes";
       },
+      notify: (message: string) => notified.push(message),
     });
     await fireSessionStart(childPi, childCtx);
 
@@ -1056,6 +1191,9 @@ describe("fact-shaping inheritance stops at live authority", () => {
     expect(readReviewLog().map((entry) => entry.event)).toContain(
       "authorizer_chain_unregistered_link",
     );
+    // And the operator answering that prompt is told why no judge answered it:
+    // the review log alone left the skip invisible (#861).
+    expect(notified).toEqual([unregisteredLinkMessage("parent-only-judge")]);
 
     rmSync(parentCwd, { recursive: true, force: true });
     rmSync(childCwd, { recursive: true, force: true });
@@ -1188,12 +1326,18 @@ describe("ready emitted after service publication", () => {
 
     await pi.fire(
       "before_agent_start",
-      { systemPrompt: "", systemPromptOptions: { cwd: "/test" } },
+      {
+        systemPrompt: "",
+        systemPromptOptions: makePromptOptions({ cwd: "/test" }),
+      },
       ctx,
     );
     await pi.fire(
       "before_agent_start",
-      { systemPrompt: "", systemPromptOptions: { cwd: "/test" } },
+      {
+        systemPrompt: "",
+        systemPromptOptions: makePromptOptions({ cwd: "/test" }),
+      },
       ctx,
     );
 
@@ -1222,7 +1366,10 @@ describe("ready emitted after service publication", () => {
     await fireSessionStart(pi, ctx);
     await pi.fire(
       "before_agent_start",
-      { systemPrompt: "", systemPromptOptions: { cwd: "/test" } },
+      {
+        systemPrompt: "",
+        systemPromptOptions: makePromptOptions({ cwd: "/test" }),
+      },
       ctx,
     );
     expect(emissions).toBe(2);
@@ -1232,12 +1379,18 @@ describe("ready emitted after service publication", () => {
     await fireSessionStart(pi, ctx);
     await pi.fire(
       "before_agent_start",
-      { systemPrompt: "", systemPromptOptions: { cwd: "/test" } },
+      {
+        systemPrompt: "",
+        systemPromptOptions: makePromptOptions({ cwd: "/test" }),
+      },
       ctx,
     );
     await pi.fire(
       "before_agent_start",
-      { systemPrompt: "", systemPromptOptions: { cwd: "/test" } },
+      {
+        systemPrompt: "",
+        systemPromptOptions: makePromptOptions({ cwd: "/test" }),
+      },
       ctx,
     );
     expect(emissions).toBe(4);
@@ -1773,6 +1926,77 @@ describe("session approvals do not leak across same-cwd session switches", () =>
   });
 });
 
+describe("tool-surface prose under a custom system prompt", () => {
+  // Pi writes no tool list or rules when it builds the prompt from a custom
+  // one. A root node leaves it that way; a subagent child, whose prompt is
+  // always a custom one, still states its own tools.
+  const custom = "You are my personal coding assistant.";
+
+  function customPromptEvent(cwd: string) {
+    return {
+      systemPrompt: custom,
+      systemPromptOptions: makePromptOptions({
+        cwd,
+        customPrompt: custom,
+        toolSnippets: { read: "Read file contents" },
+      }),
+    };
+  }
+
+  it("leaves a root session's custom prompt as Pi built it", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-perm-custom-root-cwd-"));
+    const pi = makeFakePi({ toolNames: ["read"] });
+    piPermissionSystemExtension(pi as unknown as ExtensionAPI);
+    const ctx = makeBaseCtx(cwd, "custom-root-session");
+    await fireSessionStart(pi, ctx);
+
+    const event = customPromptEvent(cwd);
+    const result = await pi.fire("before_agent_start", event, ctx);
+
+    expect(result).toEqual({});
+    expect(event.systemPromptOptions.sections).toEqual({});
+
+    await pi.fire("session_shutdown");
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("states a registered child's tools under its custom prompt", async () => {
+    const parentCwd = mkdtempSync(join(tmpdir(), "pi-perm-custom-parent-cwd-"));
+    const childCwd = mkdtempSync(join(tmpdir(), "pi-perm-custom-child-cwd-"));
+    const parentSessionId = "custom-parent-session";
+    const childSessionId = "custom-child-session";
+
+    const parentPi = makeFakePi({
+      toolNames: ["read"],
+      events: createEventBus(),
+    });
+    piPermissionSystemExtension(parentPi as unknown as ExtensionAPI);
+    const childPi = makeFakePi({
+      toolNames: ["read"],
+      events: createEventBus(),
+    });
+    piPermissionSystemExtension(childPi as unknown as ExtensionAPI);
+
+    await fireSessionStart(parentPi, makeBaseCtx(parentCwd, parentSessionId));
+    getSubagentSessionRegistry().register(childSessionId, { parentSessionId });
+    const childCtx = makeChildCtx(childCwd, childSessionId);
+    await fireSessionStart(childPi, childCtx);
+
+    const event = customPromptEvent(childCwd);
+    const result = await childPi.fire("before_agent_start", event, childCtx);
+
+    expect(result).toEqual({});
+    expect(event.systemPromptOptions.sections.tools).toBe(
+      "- read: Read file contents",
+    );
+
+    await childPi.fire("session_shutdown");
+    await parentPi.fire("session_shutdown");
+    rmSync(parentCwd, { recursive: true, force: true });
+    rmSync(childCwd, { recursive: true, force: true });
+  });
+});
+
 describe("forwarded grant-scope selection round-trip", () => {
   // A UI-present serving ctx whose `select` drives the two-step forwarded
   // dialog: the main prompt picks "for this session" (options[1]); the scope
@@ -2103,5 +2327,560 @@ describe("directional external-directory relief (#806)", () => {
       const outcome = await runPathTool(bare, toolName, externalPath);
       expect(outcome.prompts).toHaveLength(1);
     }
+  });
+});
+
+describe("configured prompt preferences reach the inline dialog", () => {
+  /**
+   * A TUI ctx whose `ui.custom` captures the dialog component.
+   *
+   * The composition root's other UI ctx drives the `select`/`input` fallback,
+   * which has no hotkeys at all — only `mode: "tui"` reaches the inline
+   * keybind dialog, which is where a configured binding is observable.
+   */
+  function makeTuiCtx(
+    cwd: string,
+    sessionName?: string,
+  ): {
+    ctx: unknown;
+    render: () => string[];
+    press: (data: string) => void;
+    notified: string[];
+    terminalWrites: string[];
+  } {
+    const terminalWrites: string[] = [];
+    let component:
+      | { render(width: number): string[]; handleInput(data: string): void }
+      | undefined;
+    const notified: string[] = [];
+    const base = makeBaseCtx(cwd, "tui-session", {
+      sessionName,
+      notify: (message: string): void => {
+        notified.push(message);
+      },
+    }) as {
+      ui: Record<string, unknown>;
+    };
+    const ctx = {
+      ...base,
+      mode: "tui",
+      ui: {
+        ...base.ui,
+        getToolsExpanded: (): boolean => false,
+        setToolsExpanded: (): void => {},
+        custom: (
+          factory: (
+            tui: {
+              requestRender: () => void;
+              terminal: { write(data: string): void };
+            },
+            theme: { fg(color: string, text: string): string },
+            keybindings: { matches(data: string, action: string): boolean },
+            done: (decision: unknown) => void,
+          ) => typeof component,
+        ): Promise<unknown> =>
+          new Promise((resolve) => {
+            component = factory(
+              {
+                requestRender: (): void => {},
+                terminal: {
+                  write: (data): void => {
+                    terminalWrites.push(data);
+                  },
+                },
+              },
+              { fg: (_color, text) => text },
+              { matches: () => false },
+              resolve,
+            );
+          }),
+      },
+    };
+    return {
+      ctx,
+      render: () => component?.render(80) ?? [],
+      press: (data) => {
+        component?.handleInput(data);
+      },
+      notified,
+      terminalWrites,
+    };
+  }
+
+  /** The hotkey each option row advertises, in rendered order. */
+  function optionKeys(lines: string[]): (string | undefined)[] {
+    return lines
+      .map((line) => /^[ \u25b6] \((\w)\) /.exec(line)?.[1])
+      .filter((key) => key !== undefined);
+  }
+
+  it("rings the configured channels when a prompt opens, and only then", async () => {
+    writeGlobalConfig({
+      permission: { "*": "allow", demo: "ask" },
+      promptNotifications: ["bell"],
+    });
+
+    const cwd = mkdtempSync(join(tmpdir(), "pi-perm-notify-cwd-"));
+    const pi = makeFakePi({ toolNames: ["demo", "quiet"] });
+    piPermissionSystemExtension(pi as unknown as ExtensionAPI);
+
+    const { ctx, press, terminalWrites } = makeTuiCtx(cwd);
+    await fireSessionStart(pi, ctx);
+
+    // A call the policy allows opens no dialog, so nothing rings.
+    await pi.fire(
+      "tool_call",
+      { toolName: "quiet", toolCallId: "notify-allowed", input: {} },
+      ctx,
+    );
+    expect(terminalWrites).toEqual([]);
+
+    const decision = pi.fire(
+      "tool_call",
+      { toolName: "demo", toolCallId: "notify-ask", input: {} },
+      ctx,
+    ) as Promise<{ block?: true }>;
+    await sleep(0);
+
+    expect(terminalWrites).toEqual(["\x07"]);
+
+    press("y");
+    press("y");
+    expect((await decision).block).toBeUndefined();
+    expect(terminalWrites).toEqual(["\x07"]);
+
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  describe("notification text", () => {
+    async function openPrompt(sessionName?: string) {
+      writeGlobalConfig({
+        permission: { "*": "allow", demo: "ask" },
+        promptNotifications: ["osc777"],
+      });
+      const cwd = mkdtempSync(join(tmpdir(), "pi-perm-notice-cwd-"));
+      const pi = makeFakePi({ toolNames: ["demo"] });
+      piPermissionSystemExtension(pi as unknown as ExtensionAPI);
+      const { ctx, press, terminalWrites } = makeTuiCtx(cwd, sessionName);
+      await fireSessionStart(pi, ctx);
+
+      const decision = pi.fire(
+        "tool_call",
+        { toolName: "demo", toolCallId: "notice-ask", input: {} },
+        ctx,
+      ) as Promise<{ block?: true }>;
+      await sleep(0);
+      const writes = [...terminalWrites];
+
+      press("y");
+      press("y");
+      await decision;
+      rmSync(cwd, { recursive: true, force: true });
+      return { cwd, writes };
+    }
+
+    it("names the session and the requested tool", async () => {
+      const { writes } = await openPrompt("refactor-auth");
+
+      expect(writes).toEqual([
+        "\x1b]777;notify;pi \u2014 refactor-auth;Permission Required: demo\x07",
+      ]);
+    });
+
+    it("names the working directory for an unnamed session", async () => {
+      const { cwd, writes } = await openPrompt();
+
+      expect(writes).toEqual([
+        `\x1b]777;notify;pi \u2014 ${basename(cwd)};Permission Required: demo\x07`,
+      ]);
+    });
+  });
+
+  it("renders and honors the characters the config bound", async () => {
+    writeGlobalConfig({
+      permission: { "*": "allow", demo: "ask" },
+      permissionDialogKeys: {
+        approve: "1",
+        approveSession: "2",
+        deny: "4",
+        denyWithReason: "5",
+      },
+    });
+
+    const cwd = mkdtempSync(join(tmpdir(), "pi-perm-keys-cwd-"));
+    const pi = makeFakePi({ toolNames: ["demo"] });
+    piPermissionSystemExtension(pi as unknown as ExtensionAPI);
+
+    const { ctx, render, press } = makeTuiCtx(cwd);
+    await fireSessionStart(pi, ctx);
+
+    const decision = pi.fire(
+      "tool_call",
+      { toolName: "demo", toolCallId: "keys-ask", input: {} },
+      ctx,
+    ) as Promise<{ block?: true }>;
+    await sleep(0);
+
+    expect(optionKeys(render())).toEqual(["1", "2", "4", "5"]);
+
+    // The default letter is no longer live; the configured one commits.
+    press("n");
+    press("n");
+    press("4");
+    press("4");
+    expect((await decision).block).toBe(true);
+
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("warns about a refused binding and leaves the policy alone", async () => {
+    writeGlobalConfig({
+      debugLog: true,
+      permission: { "*": "allow", demo: "ask" },
+      permissionDialogKeys: { deny: "j" },
+    });
+
+    const cwd = mkdtempSync(join(tmpdir(), "pi-perm-keys-bad-cwd-"));
+    const pi = makeFakePi({ toolNames: ["demo", "quiet"] });
+    piPermissionSystemExtension(pi as unknown as ExtensionAPI);
+
+    const { ctx, render, press, notified } = makeTuiCtx(cwd);
+    await fireSessionStart(pi, ctx);
+
+    // The operator is told, in the session that has a UI to tell (#933).
+    expect(
+      notified.filter((message) =>
+        message.includes('permissionDialogKeys.deny: "j"'),
+      ),
+    ).toHaveLength(1);
+
+    // The scope was not rejected: `*: allow` still allows, so a tool the config
+    // does not name never prompts at all.
+    const allowed = (await pi.fire(
+      "tool_call",
+      { toolName: "quiet", toolCallId: "keys-allowed", input: {} },
+      ctx,
+    )) as { block?: true };
+    expect(allowed.block).toBeUndefined();
+
+    // And the refused decision kept its default letter.
+    const decision = pi.fire(
+      "tool_call",
+      { toolName: "demo", toolCallId: "keys-default", input: {} },
+      ctx,
+    ) as Promise<{ block?: true }>;
+    await sleep(0);
+    expect(optionKeys(render())).toEqual(["y", "s", "n", "r"]);
+    press("n");
+    press("n");
+    expect((await decision).block).toBe(true);
+
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  // #933: a config issue that exists before the session starts reached the
+  // debug log and nothing else, because the factory-time priming refresh
+  // recorded the warning as delivered while having no ctx to deliver it.
+  describe("a config issue present at session start", () => {
+    it("is shown by session_start alone, before the first turn", async () => {
+      // The shape `detectPermissiveBashFallback` exists to flag.
+      writeGlobalConfig({ permission: { "*": "allow" } });
+
+      const cwd = mkdtempSync(join(tmpdir(), "pi-perm-warn-start-cwd-"));
+      const pi = makeFakePi({ toolNames: ["demo"] });
+      piPermissionSystemExtension(pi as unknown as ExtensionAPI);
+
+      // No before_agent_start: that fires when the operator submits a prompt,
+      // so session_start must carry the warning on its own.
+      const { ctx, notified } = makeTuiCtx(cwd);
+      await fireSessionStart(pi, ctx);
+
+      expect(
+        notified.filter((message) =>
+          message.includes("bash commands silently inherit 'allow'"),
+        ),
+      ).toHaveLength(1);
+
+      rmSync(cwd, { recursive: true, force: true });
+    });
+
+    it("is shown once, however many turns follow", async () => {
+      // The shape `detectPermissiveBashFallback` exists to flag.
+      writeGlobalConfig({ permission: { "*": "allow" } });
+
+      const cwd = mkdtempSync(join(tmpdir(), "pi-perm-warn-cwd-"));
+      const pi = makeFakePi({ toolNames: ["demo"] });
+      piPermissionSystemExtension(pi as unknown as ExtensionAPI);
+
+      const { ctx, notified } = makeTuiCtx(cwd);
+      await fireSessionStart(pi, ctx);
+      await pi.fire(
+        "before_agent_start",
+        { systemPrompt: "", systemPromptOptions: makePromptOptions({ cwd }) },
+        ctx,
+      );
+      await pi.fire(
+        "before_agent_start",
+        { systemPrompt: "", systemPromptOptions: makePromptOptions({ cwd }) },
+        ctx,
+      );
+
+      expect(
+        notified.filter((message) =>
+          message.includes("bash commands silently inherit 'allow'"),
+        ),
+      ).toHaveLength(1);
+
+      rmSync(cwd, { recursive: true, force: true });
+    });
+
+    it("is shown on the next turn when it appears mid-session", async () => {
+      writeGlobalConfig({ permission: { "*": "ask" } });
+
+      const cwd = mkdtempSync(join(tmpdir(), "pi-perm-warn-mid-cwd-"));
+      const pi = makeFakePi({ toolNames: ["demo"] });
+      piPermissionSystemExtension(pi as unknown as ExtensionAPI);
+
+      const { ctx, notified } = makeTuiCtx(cwd);
+      await fireSessionStart(pi, ctx);
+      expect(notified).toEqual([]);
+
+      // The operator breaks their config while the session is live; it is
+      // re-read on every before_agent_start.
+      writeGlobalConfig({ permission: { "*": "allow" } });
+      await pi.fire(
+        "before_agent_start",
+        { systemPrompt: "", systemPromptOptions: makePromptOptions({ cwd }) },
+        ctx,
+      );
+
+      expect(
+        notified.filter((message) =>
+          message.includes("bash commands silently inherit 'allow'"),
+        ),
+      ).toHaveLength(1);
+
+      rmSync(cwd, { recursive: true, force: true });
+    });
+  });
+
+  // #953: the policy side and `ConfigStore` load the same config files, so a
+  // schema error was reported by both. Each fact now has one reporter: the
+  // store owns the file's own errors, the policy side the clamp it causes.
+  describe("a project config file rejected fail-closed", () => {
+    const schemaError = "Unrecognized config key 'bogusKey'.";
+    const clampNotice = "Invalid project configuration detected";
+
+    function count(notified: string[], fragment: string): number {
+      return notified.filter((message) => message.includes(fragment)).length;
+    }
+
+    it("is reported once, with its clamp, when present at session start", async () => {
+      writeGlobalConfig({ permission: { "*": "ask" } });
+      const cwd = mkdtempSync(join(tmpdir(), "pi-perm-policy-start-cwd-"));
+      writeProjectConfig(cwd, { permission: { demo: "allow" }, bogusKey: 1 });
+      const pi = makeFakePi({ toolNames: ["demo"] });
+      piPermissionSystemExtension(pi as unknown as ExtensionAPI);
+
+      const { ctx, notified } = makeTuiCtx(cwd);
+      await fireSessionStart(pi, ctx);
+
+      expect(count(notified, schemaError)).toBe(1);
+      expect(count(notified, clampNotice)).toBe(1);
+
+      rmSync(cwd, { recursive: true, force: true });
+    });
+
+    it("has its clamp explained on the next turn when broken mid-session, and only once", async () => {
+      writeGlobalConfig({ permission: { "*": "ask" } });
+      const cwd = mkdtempSync(join(tmpdir(), "pi-perm-policy-mid-cwd-"));
+      writeProjectConfig(cwd, { permission: { demo: "allow" } });
+      const pi = makeFakePi({ toolNames: ["demo"] });
+      piPermissionSystemExtension(pi as unknown as ExtensionAPI);
+
+      const { ctx, notified } = makeTuiCtx(cwd);
+      await fireSessionStart(pi, ctx);
+      expect(notified).toEqual([]);
+
+      // The operator breaks the project file while the session is live; policy
+      // is re-read by mtime, so the next turn composes a clamped policy. The
+      // rewrite is the same length, so wait out a coarse mtime first.
+      await sleep(20);
+      writeProjectConfig(cwd, { permission: { demo: "allow" }, bogusKey: 1 });
+      for (let turn = 0; turn < 2; turn++) {
+        await pi.fire(
+          "before_agent_start",
+          { systemPrompt: "", systemPromptOptions: makePromptOptions({ cwd }) },
+          ctx,
+        );
+      }
+
+      expect(count(notified, clampNotice)).toBe(1);
+
+      rmSync(cwd, { recursive: true, force: true });
+    });
+  });
+});
+
+describe("Pi's built-in MCP tools are gated on the mcp surface", () => {
+  const wipe = "mcp__danger_srv__wipe";
+  const other = "mcp__danger_srv__list";
+
+  function writeGlobalMcpConfig(servers: Record<string, unknown>): void {
+    writeFileSync(
+      join(agentDir, "mcp.json"),
+      JSON.stringify({ mcpServers: servers }),
+      "utf8",
+    );
+  }
+
+  async function callTool(
+    pi: ReturnType<typeof makeFakePi>,
+    ctx: unknown,
+    toolName: string,
+  ): Promise<{ block?: true; reason?: string } | undefined> {
+    return (await pi.fire(
+      "tool_call",
+      { toolName, toolCallId: `${toolName}-call`, input: { target: "prod" } },
+      ctx,
+    )) as { block?: true; reason?: string } | undefined;
+  }
+
+  it("denies a call when an mcp rule denies its server by its mcp.json name", async () => {
+    writeGlobalConfig({
+      permission: { "*": "allow", mcp: { "*": "allow", "danger-srv": "deny" } },
+    });
+    writeGlobalMcpConfig({ "danger-srv": { command: "danger" } });
+    const cwd = mkdtempSync(join(tmpdir(), "pi-perm-mcp-tool-cwd-"));
+    const pi = makeFakePi({ toolNames: [wipe] });
+    piPermissionSystemExtension(pi as unknown as ExtensionAPI);
+    const ctx = makeChildCtx(cwd, "mcp-tool-deny");
+    await fireSessionStart(pi, ctx);
+
+    const result = await callTool(pi, ctx, wipe);
+    expect(result?.block).toBe(true);
+
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("approves exactly the asked tool for the session", async () => {
+    writeGlobalConfig({ permission: { "*": "allow", mcp: { "*": "ask" } } });
+    writeGlobalMcpConfig({ "danger-srv": { command: "danger" } });
+    const cwd = mkdtempSync(join(tmpdir(), "pi-perm-mcp-tool-cwd-"));
+    const pi = makeFakePi({ toolNames: [wipe, other] });
+    piPermissionSystemExtension(pi as unknown as ExtensionAPI);
+    const prompted: string[] = [];
+    const ctx = makeBaseCtx(cwd, "mcp-tool-session", {
+      select: async (
+        title: string,
+        options: string[],
+      ): Promise<string | undefined> => {
+        prompted.push(title);
+        return options[1];
+      },
+    });
+    await fireSessionStart(pi, ctx);
+
+    expect((await callTool(pi, ctx, wipe))?.block).toBeUndefined();
+    expect((await callTool(pi, ctx, wipe))?.block).toBeUndefined();
+    expect(prompted).toHaveLength(1);
+
+    await callTool(pi, ctx, other);
+    expect(prompted).toHaveLength(2);
+
+    rmSync(cwd, { recursive: true, force: true });
+  });
+});
+
+describe("Pi infrastructure reads", () => {
+  // The infrastructure list is not canonicalized (#1018), while the gate checks
+  // the canonical path, so a tmpdir behind a symlink (macOS `/var`) would never
+  // match: run against the real path.
+  beforeEach(() => {
+    agentDir = realpathSync(agentDir);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+  });
+
+  async function readOutcome(
+    permission: Record<string, unknown>,
+    target: string,
+  ): Promise<{ block?: true; reason?: string } | undefined> {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-perm-infra-cwd-"));
+    writeGlobalConfig({ permission });
+    const pi = makeFakePi({ events: createEventBus() });
+    piPermissionSystemExtension(pi as unknown as ExtensionAPI);
+    const ctx = makeChildCtx(cwd, `infra-${basename(target)}`);
+    await fireSessionStart(pi, ctx);
+    const result = (await pi.fire(
+      "tool_call",
+      { name: "read", input: { path: target }, toolCallId: "tc-infra" },
+      ctx,
+    )) as { block?: true; reason?: string } | undefined;
+    rmSync(cwd, { recursive: true, force: true });
+    return result;
+  }
+
+  describe("under a targeted external_directory deny", () => {
+    it("blocks a read the bypass would otherwise allow", async () => {
+      const skill = join(agentDir, "git", "x", "SKILL.md");
+      const result = await readOutcome(
+        { "*": "allow", external_directory_read: { [skill]: "deny" } },
+        skill,
+      );
+      expect(result?.block).toBe(true);
+      expect(result?.reason).toContain("external_directory_read");
+    });
+
+    it("keeps the bypass under a catch-all deny", async () => {
+      const skill = join(agentDir, "git", "x", "SKILL.md");
+      const result = await readOutcome(
+        { "*": "allow", external_directory: { "*": "deny" } },
+        skill,
+      );
+      expect(result?.block).toBeUndefined();
+    });
+  });
+
+  describe("the package's own logs", () => {
+    it("gates a read of the review log", async () => {
+      const reviewLog = join(getGlobalLogsDir(agentDir), REVIEW_LOG_FILENAME);
+      const result = await readOutcome(
+        { "*": "allow", external_directory_read: { "*": "deny" } },
+        reviewLog,
+      );
+      expect(result?.block).toBe(true);
+    });
+
+    it("still auto-allows the package's config beside them", async () => {
+      const result = await readOutcome(
+        { "*": "allow", external_directory_read: { "*": "deny" } },
+        getGlobalConfigPath(agentDir),
+      );
+      expect(result?.block).toBeUndefined();
+    });
+  });
+
+  describe("under a catch-all external_directory_read deny", () => {
+    const DENY_ALL = { "*": "allow", external_directory_read: { "*": "deny" } };
+
+    it.each([
+      ["auth.json"],
+      ["sessions/s.jsonl"],
+      ["mcp-oauth/t.json"],
+      // Share a harness entry's prefix without being inside it.
+      ["settings.json.bak"],
+      ["skills-old/x/SKILL.md"],
+    ])("gates a read of %s, outside Pi's harness entries", async (entry) => {
+      const result = await readOutcome(DENY_ALL, join(agentDir, entry));
+      expect(result?.block).toBe(true);
+    });
+
+    it.each([["skills/x/SKILL.md"], ["settings.json"], ["APPEND_SYSTEM.md"]])(
+      "auto-allows a read of %s, one of Pi's harness entries",
+      async (entry) => {
+        const result = await readOutcome(DENY_ALL, join(agentDir, entry));
+        expect(result?.block).toBeUndefined();
+      },
+    );
   });
 });

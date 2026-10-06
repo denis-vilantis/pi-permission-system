@@ -6,7 +6,7 @@
 
 stdenv.mkDerivation {
   pname = "pi-permission-system";
-  version = "32.0.4";
+  version = "40.0.0";
 
   # The flake source, minus local build byproducts. `node_modules` is rebuilt
   # from `bun.lock` through the bun2nix dependency cache.

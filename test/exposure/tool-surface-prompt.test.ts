@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  renderToolSurface,
+  renderToolSurfaceSections,
   type ToolSurfaceInputs,
 } from "#src/exposure/tool-surface-prompt";
 
@@ -21,197 +21,76 @@ function inputs(overrides: Partial<ToolSurfaceInputs> = {}): ToolSurfaceInputs {
     allowedTools: ["read"],
     toolSnippets: SNIPPETS,
     guidelinesByTool: new Map(),
+    promptGuidelines: [],
     ...overrides,
   };
 }
 
-/**
- * A prompt shaped the way `buildSystemPrompt` writes one: the preamble
- * sentence, the tool surface, then the layers that follow it.
- */
-function piPrompt(): string {
-  return [
-    "You are an expert coding assistant operating inside pi, a coding agent harness.",
-    "",
-    "Available tools:",
-    "- read: Read file contents",
-    "- bash: Execute bash commands (ls, grep, find, etc.)",
-    "",
-    "In addition to the tools above, you may have access to other custom tools depending on the project.",
-    "",
-    "Guidelines:",
-    "- Use bash for file operations like ls, rg, find",
-    "- Be concise in your responses",
-    "",
-    "Pi documentation (read only when the user asks about pi itself):",
-    "- Main documentation: /pi/README.md",
-    "",
-    "<project_context>",
-    "Project instructions.",
-    "</project_context>",
-    "",
-    "Current working directory: /repo",
-  ].join("\n");
+function rulesOf(overrides: Partial<ToolSurfaceInputs> = {}): string[] {
+  return renderToolSurfaceSections(inputs(overrides)).rules.split("\n");
 }
 
-describe("renderToolSurface", () => {
-  describe("removing what Pi wrote", () => {
-    it("drops the tool list, the filler sentence, and the guidelines", () => {
-      const result = renderToolSurface(piPrompt(), inputs());
-      const identity = result.slice(0, result.indexOf("Current working"));
-
-      expect(identity).not.toContain("- bash: Execute bash commands");
-      expect(identity).not.toContain("In addition to the tools above");
-      expect(identity).not.toContain("Guidelines:");
-      expect(identity).not.toContain("Available tools:");
-    });
-
-    it("leaves everything outside the tool surface byte for byte", () => {
-      const result = renderToolSurface(piPrompt(), inputs());
-
-      expect(result).toContain(
-        "You are an expert coding assistant operating inside pi, a coding agent harness.",
-      );
-      expect(result).toContain(
-        "Pi documentation (read only when the user asks about pi itself):",
-      );
-      expect(result).toContain("<project_context>\nProject instructions.");
-      expect(result).toContain("Current working directory: /repo");
-    });
-
-    it("renders a block for a prompt carrying no tool surface at all", () => {
-      const result = renderToolSurface("You are a child agent.", inputs());
-
-      expect(result).toBe(
-        [
-          "You are a child agent.",
-          "",
-          "Available tools:",
-          "- read: Read file contents",
-          "",
-          "Guidelines:",
-          "- Be concise in your responses",
-          "- Show file paths clearly when working with files",
-        ].join("\n"),
-      );
-    });
-
-    it("is unchanged by a second pass over its own output", () => {
-      const once = renderToolSurface(piPrompt(), inputs());
-      const twice = renderToolSurface(once, inputs());
-
-      expect(twice).toBe(once);
-    });
-
-    it("removes a section-header-shaped line in project context, indented or not", () => {
-      // Documents current behavior rather than endorsing it: the headers are
-      // matched on their trimmed text with no check that Pi wrote them, so a
-      // project's own AGENTS.md heading of the same name is removed too.
-      // Carried over from the narrowing implementation, which mangled the same
-      // line; recorded as an accepted residual in ADR 0014.
-      const prompt = [
-        "You are an assistant.",
-        "",
-        "<project_context>",
-        "  Guidelines:",
-        "  - Our team writes conventional commits.",
-        "</project_context>",
-      ].join("\n");
-
-      const result = renderToolSurface(prompt, inputs());
-
-      expect(result).not.toContain("Our team writes conventional commits.");
-      expect(result).toContain("<project_context>");
-    });
-
-    it("keeps a Guidelines section that ends the prompt from swallowing later prose", () => {
-      const prompt = [
-        "Guidelines:",
+describe("renderToolSurfaceSections", () => {
+  it("states the allowed tools and their rules as untagged section contents", () => {
+    expect(
+      renderToolSurfaceSections(
+        inputs({
+          allowedTools: ["read", "edit"],
+          guidelinesByTool: new Map([["read", ["Read before editing"]]]),
+        }),
+      ),
+    ).toEqual({
+      tools: [
+        "- read: Read file contents",
+        "- edit: Make precise file edits with exact text replacement",
+      ].join("\n"),
+      rules: [
+        "- Read before editing",
         "- Be concise in your responses",
-        "",
-        "Some closing prose that is not a section body.",
-      ].join("\n");
-
-      const result = renderToolSurface(prompt, inputs());
-
-      expect(result).toContain(
-        "Some closing prose that is not a section body.",
-      );
+        "- Show file paths clearly when working with files",
+      ].join("\n"),
     });
   });
 
-  describe("placing this session's block", () => {
-    it("appends the block after every layer a child inherits", () => {
-      const result = renderToolSurface(piPrompt(), inputs());
-
-      expect(result.indexOf("Available tools:")).toBeGreaterThan(
-        result.indexOf("Current working directory: /repo"),
-      );
+  it("omits the tools section when no allowed tool has a snippet", () => {
+    expect(
+      renderToolSurfaceSections(inputs({ allowedTools: ["undescribed"] })),
+    ).toEqual({
+      rules: [
+        "- Be concise in your responses",
+        "- Show file paths clearly when working with files",
+      ].join("\n"),
     });
+  });
 
-    it("ends the prompt with the block", () => {
-      const result = renderToolSurface(piPrompt(), inputs());
-
+  describe("the tools section", () => {
+    it("lists the allowed tools with Pi's own snippets, in the allowed order", () => {
       expect(
-        result.endsWith("- Show file paths clearly when working with files"),
-      ).toBe(true);
-    });
-  });
-
-  describe("the Available tools section", () => {
-    it("lists the allowed tools with Pi's own snippets", () => {
-      const result = renderToolSurface(
-        piPrompt(),
-        inputs({ allowedTools: ["read", "grep"] }),
+        renderToolSurfaceSections(inputs({ allowedTools: ["read", "grep"] }))
+          .tools,
+      ).toBe(
+        ["- read: Read file contents", "- grep: Search file contents"].join(
+          "\n",
+        ),
       );
-
-      expect(result).toContain(
-        [
-          "Available tools:",
-          "- read: Read file contents",
-          "- grep: Search file contents",
-        ].join("\n"),
-      );
-    });
-
-    it("omits a denied tool", () => {
-      const result = renderToolSurface(
-        piPrompt(),
-        inputs({ allowedTools: ["read"] }),
-      );
-
-      expect(result).not.toContain("- bash:");
     });
 
     it("omits a tool Pi supplied no snippet for", () => {
-      const result = renderToolSurface(
-        piPrompt(),
-        inputs({
-          allowedTools: ["read", "ask_parent"],
-          toolSnippets: { read: SNIPPETS.read },
-        }),
-      );
-
-      expect(result).toContain("- read: Read file contents");
-      expect(result).not.toContain("ask_parent");
-    });
-
-    it("writes no section when no allowed tool has a snippet", () => {
-      const result = renderToolSurface(
-        piPrompt(),
-        inputs({ allowedTools: ["ask_parent"], toolSnippets: {} }),
-      );
-
-      expect(result).not.toContain("Available tools:");
-      expect(result).toContain("Guidelines:");
+      expect(
+        renderToolSurfaceSections(
+          inputs({
+            allowedTools: ["read", "ask_parent"],
+            toolSnippets: { read: SNIPPETS.read },
+          }),
+        ).tools,
+      ).toBe("- read: Read file contents");
     });
   });
 
-  describe("the Guidelines section", () => {
+  describe("the rules section", () => {
     it("carries each allowed tool's own guideline bullets", () => {
-      const result = renderToolSurface(
-        piPrompt(),
-        inputs({
+      expect(
+        rulesOf({
           allowedTools: ["read", "edit"],
           guidelinesByTool: new Map([
             ["read", ["Use read to examine files instead of cat or sed."]],
@@ -221,188 +100,114 @@ describe("renderToolSurface", () => {
             ],
           ]),
         }),
-      );
-
-      expect(result).toContain(
+      ).toEqual([
         "- Use read to examine files instead of cat or sed.",
-      );
-      expect(result).toContain(
         "- Use edit for precise changes (old text must match exactly)",
-      );
+        "- Be concise in your responses",
+        "- Show file paths clearly when working with files",
+      ]);
     });
 
     it("omits a denied tool's guideline bullets", () => {
-      const result = renderToolSurface(
-        piPrompt(),
-        inputs({
+      expect(
+        rulesOf({
           allowedTools: ["read"],
           guidelinesByTool: new Map([
             ["read", ["Use read to examine files instead of cat or sed."]],
             ["write", ["Use write only for new files or complete rewrites"]],
           ]),
         }),
-      );
-
-      expect(result).toContain(
-        "- Use read to examine files instead of cat or sed.",
-      );
-      expect(result).not.toContain("Use write only for new files");
+      ).not.toContain("- Use write only for new files or complete rewrites");
     });
 
-    it("carries a third-party tool's guidelines, which no built-in table names", () => {
-      const result = renderToolSurface(
-        piPrompt(),
-        inputs({
+    it("carries a third-party tool's guidelines", () => {
+      expect(
+        rulesOf({
           allowedTools: ["colgrep"],
           toolSnippets: { colgrep: "Semantic code search" },
           guidelinesByTool: new Map([
             ["colgrep", ["Prefer colgrep for intent-based searches."]],
           ]),
         }),
-      );
-
-      expect(result).toContain("- Prefer colgrep for intent-based searches.");
+      ).toContain("- Prefer colgrep for intent-based searches.");
     });
 
     it("de-duplicates a bullet two tools both contribute", () => {
       const shared = "Do not use emojis";
-      const result = renderToolSurface(
-        piPrompt(),
-        inputs({
-          allowedTools: ["read", "edit"],
-          guidelinesByTool: new Map([
-            ["read", [shared]],
-            ["edit", [shared]],
-          ]),
-        }),
-      );
+      const occurrences = rulesOf({
+        allowedTools: ["read", "edit"],
+        guidelinesByTool: new Map([
+          ["read", [shared]],
+          ["edit", [shared]],
+        ]),
+      }).filter((line) => line === `- ${shared}`);
 
-      const occurrences = result
-        .split("\n")
-        .filter((line) => line === `- ${shared}`);
       expect(occurrences).toHaveLength(1);
     });
 
     it("always ends with Pi's two unconditional bullets", () => {
-      const result = renderToolSurface(piPrompt(), inputs());
-
-      expect(result).toContain(
-        [
-          "- Be concise in your responses",
-          "- Show file paths clearly when working with files",
-        ].join("\n"),
-      );
+      expect(rulesOf().slice(-2)).toEqual([
+        "- Be concise in your responses",
+        "- Show file paths clearly when working with files",
+      ]);
     });
 
     describe("Pi's file-exploration bullet", () => {
-      it("is written when bash is the only way to explore", () => {
-        const result = renderToolSurface(
-          piPrompt(),
-          inputs({ allowedTools: ["bash"] }),
-        );
-
-        expect(result).toContain(
+      it("is written first when bash is the only way to explore", () => {
+        expect(rulesOf({ allowedTools: ["bash"] })[0]).toBe(
           "- Use bash for file operations like ls, rg, find",
         );
       });
 
       it("is withheld when a dedicated exploration tool is allowed", () => {
-        const result = renderToolSurface(
-          piPrompt(),
-          inputs({ allowedTools: ["bash", "grep"] }),
-        );
-
-        expect(result).not.toContain(
-          "Use bash for file operations like ls, rg, find",
+        expect(rulesOf({ allowedTools: ["bash", "grep"] })).not.toContain(
+          "- Use bash for file operations like ls, rg, find",
         );
       });
 
       it("is withheld when no shell is allowed", () => {
-        const result = renderToolSurface(
-          piPrompt(),
-          inputs({ allowedTools: ["read"] }),
-        );
-
-        expect(result).not.toContain("for file operations like");
+        expect(rulesOf({ allowedTools: ["read"] })).toEqual([
+          "- Be concise in your responses",
+          "- Show file paths clearly when working with files",
+        ]);
       });
 
       it("names PowerShell when it is the only shell", () => {
-        const result = renderToolSurface(
-          piPrompt(),
-          inputs({ allowedTools: ["powershell"] }),
-        );
-
-        expect(result).toContain(
+        expect(rulesOf({ allowedTools: ["powershell"] })[0]).toBe(
           "- Use PowerShell for file operations like listing, searching, and finding files",
         );
       });
 
       it("names both shells when both are allowed", () => {
-        const result = renderToolSurface(
-          piPrompt(),
-          inputs({ allowedTools: ["bash", "powershell"] }),
-        );
-
-        expect(result).toContain(
+        expect(rulesOf({ allowedTools: ["bash", "powershell"] })[0]).toBe(
           "- Use bash or PowerShell for file operations like listing, searching, and finding files",
         );
       });
     });
-  });
 
-  describe("the prefix a subagent child shares with its parent", () => {
-    it("leaves the identity byte-identical when parent and child allow different tools", () => {
-      // What #180/#400 created and #890 restored: the child's leading bytes
-      // match the parent's, so a prefix-reusing engine does not reprocess them.
-      const parent = renderToolSurface(
-        piPrompt(),
-        inputs({ allowedTools: ["read", "bash"] }),
-      );
-      const child = renderToolSurface(
-        piPrompt(),
-        inputs({ allowedTools: ["read"] }),
-      );
+    describe("extension-contributed rules", () => {
+      it("carries a rule no tool contributes, after the tools' own and before Pi's two", () => {
+        expect(
+          rulesOf({
+            guidelinesByTool: new Map([["read", ["Read before editing"]]]),
+            promptGuidelines: ["An extension's rule"],
+          }),
+        ).toEqual([
+          "- Read before editing",
+          "- An extension's rule",
+          "- Be concise in your responses",
+          "- Show file paths clearly when working with files",
+        ]);
+      });
 
-      const identityEnd = parent.indexOf("Current working directory: /repo");
-      const identity = parent.slice(0, identityEnd);
-
-      expect(identity.length).toBeGreaterThan(0);
-      expect(child.startsWith(identity)).toBe(true);
-    });
-
-    it("diverges only after the identity, where the two blocks differ", () => {
-      const parent = renderToolSurface(
-        piPrompt(),
-        inputs({ allowedTools: ["read", "bash"] }),
-      );
-      const child = renderToolSurface(
-        piPrompt(),
-        inputs({ allowedTools: ["read"] }),
-      );
-
-      expect(child).not.toBe(parent);
-      expect(parent).toContain("- bash:");
-      expect(child).not.toContain("- bash:");
-    });
-  });
-
-  describe("stability across turns", () => {
-    it("renders the same block whether Pi's listing is full or already narrowed", () => {
-      const narrowed = piPrompt().replace(
-        "- bash: Execute bash commands (ls, grep, find, etc.)\n",
-        "",
-      );
-
-      const fromFull = renderToolSurface(
-        piPrompt(),
-        inputs({ allowedTools: ["read"] }),
-      );
-      const fromNarrowed = renderToolSurface(
-        narrowed,
-        inputs({ allowedTools: ["read"] }),
-      );
-
-      expect(fromNarrowed).toBe(fromFull);
+      it("does not carry a denied tool's rule back in by that route", () => {
+        expect(
+          rulesOf({
+            guidelinesByTool: new Map([["bash", ["  Use bash carefully"]]]),
+            promptGuidelines: ["Use bash carefully "],
+          }),
+        ).not.toContain("- Use bash carefully");
+      });
     });
   });
 });

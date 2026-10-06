@@ -384,6 +384,8 @@ Policy decisions that resolve without an active UI prompt, such as `policy_allow
 Non-UI child sessions also do not emit this event when they create a forwarded permission request; the parent UI session emits it immediately before showing the forwarded permission dialog.
 A forwarded request the parent's own recorded policy decides (a matching `allow` or `deny`) is answered without a prompt and emits no event; the event fires only when the parent is actually about to ask the human.
 The matching terminal `permissions:decision` is emitted in the parent session too, so a consumer that reacts to this event has a signal on the same bus telling it the prompt is over.
+Asks are presented one at a time: the host holds a single inline dialog slot, so a session that raises a second ask while one is still open queues it rather than mounting over the first.
+The event marks the moment the queued ask is presented, not the moment it was raised, which is what keeps "the user needs to respond now" true for a consumer that alerts on it.
 Forwarded prompts that do reach the human are not degraded: the parent emits the child's original `source` and the same `surface`/`value` display projection, plus a populated `forwarding` context identifying the requesting subagent.
 
 The payload is lean by design — `surface`/`value` are the normalized display projection a notification consumer reads, not a mirror of the internal review log.
@@ -426,16 +428,17 @@ Forwarding is orthogonal to origin: a forwarded subagent prompt keeps its origin
 The facts every render of the ask shows, that no renderer's budget may elide.
 Nested rather than flattened so the event and the prompt payload share one shape: a fact added here reaches the bus without a second hand-maintained declaration.
 
-| Field             | Type                         | Description                                                                                      |
-| ----------------- | ---------------------------- | ------------------------------------------------------------------------------------------------ |
-| `requester`       | `PromptRequester`            | Who is asking, and whether the ask arrived from a subagent                                       |
-| `surface`         | `string`                     | The **gate** surface the rule fired on — `"external_directory"`, `"path"`, `"bash"`, a tool name |
-| `toolName`        | `string \| null`             | The gated tool name; `null` when the ask is not tool-shaped                                      |
-| `invokedToolName` | `string \| null`             | The invoked name when a shell alias re-exposes bash under another name                           |
-| `value`           | `string`                     | The decision-relevant value: the command, path, MCP target, or skill name                        |
-| `matchedPattern`  | `string \| null`             | The matched rule, including a sentinel such as `<indirection-bash-wrapper>`                      |
-| `commandContext`  | `BashCommandContext \| null` | Where the offending bash unit runs, when it came from a substitution or subshell                 |
-| `executedUnit`    | `string \| null`             | For bash, the unit that will actually run, including inside an unstrippable wrapper              |
+| Field             | Type                         | Description                                                                                        |
+| ----------------- | ---------------------------- | -------------------------------------------------------------------------------------------------- |
+| `requester`       | `PromptRequester`            | Who is asking, and whether the ask arrived from a subagent                                         |
+| `surface`         | `string`                     | The **gate** surface the rule fired on — `"external_directory"`, `"path"`, `"bash"`, a tool name   |
+| `toolName`        | `string \| null`             | The gated tool name; `null` when the ask is not tool-shaped                                        |
+| `invokedToolName` | `string \| null`             | The invoked name when a shell alias re-exposes bash under another name                             |
+| `value`           | `string`                     | The decision-relevant value: the command, path, MCP target, or skill name                          |
+| `matchedPattern`  | `string \| null`             | The matched rule, including a sentinel such as `<indirection-bash-wrapper>`                        |
+| `matchedSpelling` | `string \| null`             | For bash, the spelling of the command the rule matched, when it did not match the command as typed |
+| `commandContext`  | `BashCommandContext \| null` | Where the offending bash unit runs, when it came from a substitution or subshell                   |
+| `executedUnit`    | `string \| null`             | For bash, the unit that will actually run, including inside an unstrippable wrapper                |
 
 `PromptRequester` carries `agentName` (`string | null`), `forwarded` (`boolean`), and `sessionId` (`string | null`, the requesting session for a forwarded ask).
 
@@ -513,6 +516,39 @@ pi.events.on("permissions:decision", (raw) => {
 | `auto_approved`               | Yolo mode — approved automatically without dialog                    |
 | `confirmation_unavailable`    | State was `ask` but no UI was available — blocked                    |
 | `gate_error`                  | The gate threw, or an escalation failed — blocked, fail-closed       |
+
+### Recipe: bridging a prompt to an external notifier
+
+This extension can ring the terminal itself (`promptNotifications` in [configuration.md](configuration.md#terminal-notifications)).
+Anything beyond that (running a program, reporting to a session manager such as Herdr, calling `cmux notify`, pushing to a phone) belongs in a small extension of your own that listens to the two broadcasts.
+This package does not emit another tool's events itself: an outbound bridge would tie it to that tool's contract, where a listener leaves both sides free to change.
+
+The two channels pair up by `requestId`.
+`permissions:ui_prompt` means the human is being asked right now, and the `permissions:decision` carrying the same `requestId` means that prompt is over, however it ended.
+Track the open ids rather than a counter or a boolean: several prompts can be pending at once (queued in one session, or forwarded from subagents), and a decision for a request that never prompted must not clear anything.
+
+```typescript
+import type {
+  PermissionDecisionEvent,
+  PermissionUiPromptEvent,
+} from "@gotgenes/pi-permission-system";
+
+const open = new Set<string>();
+
+pi.events.on("permissions:ui_prompt", (raw) => {
+  const { requestId } = raw as PermissionUiPromptEvent;
+  if (open.size === 0) markBlocked(); // e.g. herdr:blocked { active: true }
+  open.add(requestId);
+});
+
+pi.events.on("permissions:decision", (raw) => {
+  const { requestId } = raw as PermissionDecisionEvent;
+  if (!open.delete(requestId)) return; // decided without a prompt
+  if (open.size === 0) clearBlocked(); // e.g. herdr:blocked { active: false }
+});
+```
+
+Both events fire on the bus of the session that shows the prompt, including the parent session that shows a forwarded subagent ask, so the listener belongs in whichever session holds the UI.
 
 ---
 

@@ -30,6 +30,7 @@ describe("unifiedConfigSchema", () => {
         toolInputPreviewMaxLength: 1000,
         toolTextSummaryMaxLength: 120,
         piInfrastructureReadPaths: ["/extra/path"],
+        permissionDialogKeys: { approve: "1", deny: "4" },
         permission: {
           "*": "ask",
           read: "allow",
@@ -353,6 +354,77 @@ describe("unifiedConfigSchema", () => {
         },
       });
       expect(result.success).toBe(true);
+    });
+  });
+
+  // The schema checks shape; whether a well-formed string is a *usable*
+  // binding is `resolveDialogKeys`' question, answered tolerantly. A
+  // misspelled decision name has no such recovery — it would simply sit
+  // inert — so it fails the scope closed like any other malformed field.
+  describe("permissionDialogKeys field", () => {
+    it("accepts a full map of decisions", () => {
+      const result = unifiedConfigSchema.safeParse({
+        permissionDialogKeys: {
+          approve: "1",
+          approveSession: "2",
+          approveSessionBoth: "3",
+          deny: "4",
+          denyWithReason: "5",
+        },
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("accepts a map naming only some decisions", () => {
+      const result = unifiedConfigSchema.safeParse({
+        permissionDialogKeys: { deny: "4" },
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects an unknown decision name", () => {
+      const result = unifiedConfigSchema.safeParse({
+        permissionDialogKeys: { approveAll: "1" },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects a non-string binding", () => {
+      const result = unifiedConfigSchema.safeParse({
+        permissionDialogKeys: { approve: 1 },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("accepts a binding the resolver will refuse, leaving that to the resolver", () => {
+      const result = unifiedConfigSchema.safeParse({
+        permissionDialogKeys: { deny: "j" },
+      });
+      expect(result.success).toBe(true);
+    });
+  });
+
+  describe("promptNotifications field", () => {
+    it("accepts every channel", () => {
+      const result = unifiedConfigSchema.safeParse({
+        promptNotifications: ["bell", "osc9", "osc777"],
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("accepts an empty list, which turns notifications off", () => {
+      const result = unifiedConfigSchema.safeParse({ promptNotifications: [] });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects an unknown channel, naming the entry", () => {
+      const result = unifiedConfigSchema.safeParse({
+        promptNotifications: ["bell", "beep"],
+      });
+      expect(result.success).toBe(false);
+      expect(result.error?.issues.map((issue) => issue.path)).toEqual([
+        ["promptNotifications", 1],
+      ]);
     });
   });
 });

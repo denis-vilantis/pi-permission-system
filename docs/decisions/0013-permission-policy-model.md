@@ -127,6 +127,76 @@ Every salvageable region of the one grammar gap this package has met is a `file_
 It is rejected anyway, for the reason the 2026-09-04 amendment already gave about the marker: a node-type trigger silently drops the next gap that lands somewhere else.
 A stub-node test pins the distinction the corpus cannot.
 
+### Amendment, 2026-09-28 — a salvage candidate may be a heredoc-free spelling
+
+The amendment above admits a region's own source text.
+That text cannot recover a heredoc tail the grammar has no production for: `cat <<EOF ; rm -rf x`, the `&` form, `cat <<EOF arg > /tmp/o`, and `cat 0<<EOF | rm -rf x` are valid bash (`bash -n` exits 0), yet the innermost unresolved node is the heredoc redirect itself or a top-level `ERROR`, and the redirect's text fails to re-parse the same way.
+Under `bash: {"*": "allow", "rm *": "deny"}` each asked where its heredoc-free spelling is denied, and approving the prompt ran `rm`.
+
+**After the regions, the salvage also offers each unresolved heredoc's line spelled without its heredoc operators, admitted by the same clean re-parse** ([#985]).
+The line runs from the heredoc's host `redirected_statement`, or its line start when an `ERROR` hosts it, to the end of the line.
+The cut removes the `<<`/`<<-` token, a `file_descriptor` before it, the delimiter, and the blanks before them.
+
+This is not the "heredoc pre-pass introducing a second notion of what a bash program is" that the residual paragraph set aside.
+The primary parse is untouched, the floor still clamps every recovered unit, and the trigger is still the parse's health: only a host that failed to parse is spelled.
+The safety argument gains one clause.
+The candidate is derived rather than sliced, but the derivation only removes spans the scanner tokenized as heredoc operators, so it cannot introduce a word the command lacks; the metamorphic anti-invention property now checks exactly that, word by word.
+
+Measured over the local review log against the pre-change code, 9156 distinct intact `bash` commands: 7 change, all the `git commit -F - <<'MSG' 2>&1 | tail -N` shape the region salvage already handled.
+Each gains only duplicated units, and no decision changes; the fail-open forms above occur nowhere in that log, so the change closes a spelling an agent could produce rather than one it has.
+
+### Amendment, 2026-09-29 — a core word may be guarded by a proof over its script
+
+§7 excluded `sed` and `awk` outright: their script or program writes as surely as an option does (`sed 'w out'`, `awk '{print > FILENAME}'`), so no option-spelling guard can speak for them.
+
+**A core word may instead be admitted behind a proof over its whole command line — options and script alike — when that proof is an allowlist** ([#924]).
+The proof names what it accepts and withdraws the claim for everything else: an option outside its list, a script command outside its grammar, an argument whose value only the shell decides (it could spell `-i`), and any shape two implementations read differently.
+`sed`'s grammar refuses a delimiter inside a bracket expression for that last reason, since BSD reads `[/]` as a bracket where GNU ends the regex at its `/`.
+`awk`'s proof is a scan rather than a grammar, so it over-retracts a comparison such as `NR>=100`; the cost is relief, never a write.
+
+This keeps the admission bar rather than lowering it.
+The bar asks for effects stable under argument content, and a guarded word meets it only for the argument lists the guard proves; everywhere else it consults both surfaces, exactly as it did outside the core.
+Measured over the local review log, 901 of 1013 `sed` invocations prove read-only, and 134 of 218 `awk` invocations did under the prototype scan.
+
+### Amendment, 2026-09-29 — an option guard sees a computed word
+
+The `find`, `fd`, and `sort` guards matched each argument's source text against their options, so a word only the shell decides (`A=-delete; find ~/other $A`) carried a withdrawing option past them.
+
+**A computed argument withdraws an option-guarded word's claim whenever it may reach the program beginning with `-`** ([#992]).
+Every guarded option has that shape, and a computed word's source text is not what the program receives, so the guard asks only that question of it.
+The answer is `false` only when a literal leading character survives every rewrite the shell applies (globbing, brace expansion, and escape removal each keep a literal prefix) and no expansion can split the word, so `packages/*/docs` and `\(` leave the claim standing.
+An unquoted expansion splits, and so may a quoted parameter expansion: `$@` and `${arr[@]}` yield one word per element, and any variable may be a nameref (`declare -n s='arr[@]'`) with nothing in its spelling to show it, so `"x$y"` withdraws too; only a quoted command substitution or arithmetic expansion stays one word.
+`sed` and `awk` keep the stricter rule above, since a computed word there can be the script itself.
+
+Measured over 70,961 unique bash commands from session transcripts and the review log, 96 `find` units that proved a read withdraw under the rule before the nameref clause, and 3 more with it, against 625 under a rule withdrawing on any computed word; none of them wrote.
+
+### Amendment, 2026-10-05 — a wrapper that only modifies execution is transparent too
+
+§11 keyed transparency on the *inner command*: a core reader is read-only whatever its argument feed holds.
+A second class of wrapper defeats the floor's reason by its *own* nature instead.
+`time`, `timeout`, `nice`, `stdbuf`, and `setsid` change only how the same visible command runs (its timing, kill deadline, scheduling, buffering, or session); every operand is on the command line, and the wrapper adds no privilege, environment, or argument feed.
+
+**A wrapper unit whose every layer is an execution modifier inherits the inner command's verdict, whatever that command does** ([#963]).
+The clause is wrapper-keyed and package-audited per wrapper, like the core; it does not widen to user declarations.
+Four guards keep the inherited verdict naming the command that really runs; without the first, second, or fourth, a measured command resolves by the wrong command's rule:
+
+- **Every** peeled layer is a modifier, since the peel looks through `sudo` and `env` as well: `time sudo rm -rf x` peels to `rm -rf x`.
+- Every option on a modifier layer is on that wrapper's allowlist, with value-taking options drawn from the same table the inner-command search skips by.
+  The real tools accept long-option abbreviations that search does not know, so `timeout --sig KILL 5 rm -rf /` was read as running `5 rm -rf /`.
+  `time`'s file-writing options (`-o`, `--output`, `-a`) are never admitted.
+  Every option, value, and operand on a modifier layer must also be literal (an environment assignment, which does not split, is exempt), since the shell splits or expands a computed word into others before the modifier runs: `timeout {5,sudo} rm x` runs `timeout 5 sudo rm x`.
+  A `--` ends the options but not `timeout`'s duration, so `timeout -- 5 sudo rm x` peels to `sudo rm x`, not to a command named `5`.
+- The peel ends at an ordinary command, not a wrapper it could not see past.
+- The inner head is a literal command name, not shell syntax: `tree-sitter-bash` has no `time` keyword, so `time { rm …; }` and `time ( … )` reach the clause with `{` or a subshell where the name should be.
+  The subshell form keeps the floor until its inner commands are enumerated ([#1027]).
+
+Unlike the core-reader clause, this one carries **no redirect refusal**.
+The core-reader clause classifies the unit as a read, so a redirect that writes contradicts it; this clause classifies nothing and inherits a verdict, and a redirect destination is projected onto the path surfaces whatever the floor decides (`timeout 5 pnpm test > /tmp/x` gates `/tmp/x` as a syntax-proven write, as the bare command does).
+A destination the parse cannot resolve (`> $OUT`) is projected for neither form, so the wrapped decision still equals the bare one; it is ADR 0009's computed-path residual, unchanged by the wrapper.
+When both clauses hold, the core-reader reason is the one recorded.
+
+Measured over the local review log from 2026-07: 298 of 1027 prompts were floored, and 73 more are relieved by this clause alone, beside the 86 the core-reader clause relieves (`scripts/measure-wrapper-transparency.mjs`).
+
 ## Context
 
 ### The reported gap
@@ -581,7 +651,8 @@ Therefore:
 
 - A wrapper unit whose `executedUnitOf` head is a bare-basename core word, with no real output redirect on the unit, **inherits the inner command's verdict** — it classifies read and resolves by the inner unit's own rules instead of the synthetic floor `ask`.
 - Everything else keeps the floor untouched: interpreters, opaque payloads, mutators, and any wrapper whose inner command is unresolvable (`executedUnitOf` fails to `null`, and that discipline is retained).
-- **v1 exemption is on the built-in core only.**
+- A wrapper unit whose every layer only modifies how its inner command runs (`time`, `timeout`, `nice`, `stdbuf`, `setsid`) also inherits the inner verdict, whatever that command does (amendment of 2026-10-05).
+- **v1 exemption is package-audited only.**
   User `commandEffects` declarations participate in effect classification but do not lift the floor: the core's argument-independence is package-audited, a user's claim about a wrapped command is not, and a wrong claim behind a wrapper fails open.
   Widening to user declarations requires evidence, not symmetry.
 
@@ -692,6 +763,7 @@ An externally launched sandbox remains the supported containment route (unverifi
 3. **Wrapper transparency** ([#803]).
    Relieves the floored pure-reader prompts (~13% of current volume).
 4. **[#609] and [#785].**
+   — landed ([#609]).
    Redirect operator classification, unconditional projection of output-redirect destinations including bare nonexistent ones, and ADR 0009's wording correction.
    Carries the breaking-change footer.
 5. **Blame threading.**
@@ -735,4 +807,9 @@ Issue [#620] carries the judgment slice the chain retains under §7.
 [#814]: https://github.com/gotgenes/pi-packages/issues/814
 [#840]: https://github.com/gotgenes/pi-packages/issues/840
 [#875]: https://github.com/gotgenes/pi-packages/issues/875
+[#924]: https://github.com/gotgenes/pi-packages/issues/924
+[#985]: https://github.com/gotgenes/pi-packages/issues/985
+[#992]: https://github.com/gotgenes/pi-packages/issues/992
+[#963]: https://github.com/gotgenes/pi-packages/issues/963
+[#1027]: https://github.com/gotgenes/pi-packages/issues/1027
 [openai/codex#28732]: https://github.com/openai/codex/issues/28732

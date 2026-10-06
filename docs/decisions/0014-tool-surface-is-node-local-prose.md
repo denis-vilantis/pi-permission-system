@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded
 date: 2026-09-08
 ---
 
@@ -7,7 +7,10 @@ date: 2026-09-08
 
 ## Status
 
-Accepted.
+Superseded by [ADR 0015](0015-prompt-changes-through-system-prompt-options.md).
+The relocation below was carried by a returned `systemPrompt`, which Pi sends as the whole prompt and which therefore dropped the sections later extensions add, `<mcp_servers>` among them.
+ADR 0015 states every prompt change through `systemPromptOptions` instead, and gives up the inherited prefix this decision kept.
+The rationale below remains useful context.
 
 ## Context
 
@@ -37,8 +40,8 @@ The tool surface is **relocated, not narrowed**.
 
 On every `before_agent_start`, in every node, `renderToolSurface` (`src/exposure/tool-surface-prompt.ts`):
 
-1. removes the `Available tools:` section, Pi's "In addition to the tools above…" filler sentence, and the `Guidelines:` section, wherever in the prompt they sit; and
-2. renders this session's own, from parts, at the **end** of the prompt — past Pi's `Current working directory:` footer, and so past everything a child inherits.
+1. removes the `Available tools:` section, Pi's "In addition to the tools above…" filler sentence, and the `Guidelines:` section, wherever Pi or this package wrote them (see the amendment below); and
+2. renders this session's own, from parts, at the **end** of the prompt — past Pi's `Current working directory:` footer (from pi 0.86, its `<cwd>` section; see the section-shape amendment below), and so past everything a child inherits.
 
 Each node then states its own tool surface, and no node edits another's bytes.
 
@@ -72,12 +75,36 @@ This is not a new cost — the override was already re-emitted every turn so ski
 - The identity a child shares with its parent is the full identity minus the relocated sections, rather than the 365 characters it had been.
 - A tool restored by a relaxed rule is still advertised one turn late: `toolSnippets` is rebuilt by Pi from the tools active at its last prompt build, so a tool withheld last turn has no snippet to render this turn.
   Unchanged by this decision.
-- **Accepted residual:** the two headers are matched on a line's *trimmed* text, with nothing tying them to Pi's authorship, so indentation does not protect a quote.
-  A project's own `AGENTS.md` heading reading `Guidelines:` — inside `<project_context>`, indented or not — is removed along with the bullet-shaped lines beneath it.
-  The previous implementation mangled the same heading by narrowing it, so the exposure is not new and no such prompt is known; a test documents the behavior rather than endorsing it.
-  Anchoring the match to Pi's own position — as `pi-subagents` locates the skills catalogue, by the footer that unconditionally follows it — is the fix if one is ever needed.
+- **Residual resolved in [#919] / [#932] — removal is now bounded to what Pi or this package wrote.**
+  The two headers were matched on a line's *trimmed* text with nothing tying them to Pi's authorship, and the removed region ran to the next line ending in a colon.
+  Both reporters hit it through a custom `SYSTEM.md`, where Pi writes no tool surface of its own, so every match was theirs: one prompt lost its tool list, both of its guideline bullets, its own trailing instruction, and Pi's `<project_context>` **opening** tag — swept because Pi's lead-in `Project-specific instructions and guidelines:` ends with a colon.
+  The fix is the one this bullet nominated.
+  The prompt is split at Pi's `Current working directory:` footer, which it writes last and unconditionally in both branches — the anchor `pi-subagents` uses for the skills catalogue.
+  Above it, sections are removed only when `systemPromptOptions.customPrompt` is absent, because that is exactly when Pi wrote a preamble of its own; below it, always, since that region holds this package's own block and any peer's under [#901].
+  A section is also bounded to its own body, so no match can sweep the prose after it.
+- **Residual resolved in [#980]: an operator's custom prompt no longer receives a block.**
+  [#919] kept appending this session's block after a custom prompt, so an operator who wrote their own tool list was shown two, and one who wrote none was shown sections Pi deliberately omits.
+  It chose that over standing aside because every subagent child is a `customPrompt` session too, and the block is a child's only tool prose.
+  See the amendment below for how the two cases are now told apart.
+- **Accepted residual:** the prompt is still split on LF and the assembled body still `trimEnd`ed, so a CRLF-authored `SYSTEM.md` is not returned byte-for-byte even when nothing is removed.
 - **Accepted residual:** a child running without this extension installed still inherits its parent's list, because nothing then relocates or restates it.
   Tracked as [#901], which records the contract a second writer must honor to stay order-independent with this one: membership from the live registry (`pi.getActiveTools()`, the one input that changes mid-chain), text from `toolSnippets`, guidelines from `getAllTools()`, and idempotent remove-then-render so the last writer in the chain is correct in either order.
+- **Amendment in [#962]: pi 0.86's section-shaped prompt.**
+  Pi 0.86 writes an untagged preamble followed by `<name>` sections joined by a blank line: the tool list is a `<tools>` section, the guidelines a `<rules>` section, and the working directory a `<cwd>` section in place of the footer.
+  None of the three anchors above matched, so the whole prompt was read as head.
+  Pi's unfiltered list then stayed at the top, the narrowed block landed below it, and in a Pi-authored prompt the first `Guidelines:` section in an AGENTS.md was removed as though it were Pi's.
+  The layout is now decided once per prompt, from whichever cwd layer sits later (a footer or a `<cwd>` section quoted in a context file is always above Pi's own), never by version.
+  On the section shape the head is searched only for Pi's `<tools>` and `<rules>`, each removed only when it closes before the first of `<docs>`, `<addendum>`, `<project_context>`, `<skills>`, and `<cwd>`, which is where Pi writes them.
+  The block is rendered in the prompt's own shape, and the tail removes a relocated block in either shape, so the [#901] contract holds for a second writer on either shape.
+  Removing Pi's `<rules>` would also drop the rules other extensions add through `systemPromptOptions.promptGuidelines`, so the relocated rules carry every such bullet no registered tool contributes; through 0.85 that field is the tools' own guidelines, and the filter leaves nothing.
+  The section shape could have been reached through `systemPromptOptions` instead of the text, but no option removes Pi's `<tools>`/`<rules>` short of `customPrompt`, and a custom `tools` section replaces Pi's in place, inside the inherited region.
+- **Amendment in [#980]: a root node under a custom prompt states no tool surface.**
+  When Pi built the prompt from `systemPromptOptions.customPrompt` and `SubagentDetector.isSubagent(ctx)` answers `false`, the handler skips this pass and hands the prompt to the skill filter exactly as Pi built it, matching Pi, which writes no tool list or rules there.
+  A node the detector recognizes as a child still renders its block, so "The block is always rendered" now reads: in every node whose prompt Pi authored, and in every subagent child.
+  Such a root returns an override only when skill filtering changed the prompt, and `{}` otherwise.
+  Both detection errors land on an existing behavior: a root misread as a child keeps the block it had before this amendment, and a child nothing recognizes gets Pi's native `customPrompt` prompt, with its tools still listed in the request's `tools` array.
+  The inherited identity is unaffected, since the dropped block lay past everything a child copies.
+  Suppressing the block in children too was considered and deferred until someone asks: a child cannot see its root's `customPrompt`, so it would need a cross-node signal or a config switch.
 - A shared prompt-composer that owns prompt layout for every extension editing this string is the direction this points at; four packages currently anchor on Pi's literal section headers.
   Not built, and no issue filed.
 
@@ -97,7 +124,11 @@ This decision makes that proposed key a verbatim substring of the child's prompt
 [#437]: https://github.com/gotgenes/pi-packages/issues/437
 [#883]: https://github.com/gotgenes/pi-packages/issues/883
 [#890]: https://github.com/gotgenes/pi-packages/issues/890
+[#919]: https://github.com/gotgenes/pi-packages/issues/919
+[#932]: https://github.com/gotgenes/pi-packages/issues/932
 [#901]: https://github.com/gotgenes/pi-packages/issues/901
+[#962]: https://github.com/gotgenes/pi-packages/issues/962
+[#980]: https://github.com/gotgenes/pi-packages/issues/980
 [pi-subagents ADR 0006]: https://github.com/gotgenes/pi-packages/blob/main/packages/pi-subagents/docs/decisions/0006-inherited-prompt-is-identity-only.md
 [pi-claude-bridge#88]: https://github.com/elidickinson/pi-claude-bridge/issues/88
 [pi-claude-bridge#89]: https://github.com/elidickinson/pi-claude-bridge/issues/89

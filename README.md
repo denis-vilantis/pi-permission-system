@@ -5,7 +5,7 @@
 # @gotgenes/pi-permission-system
 
 > **Fork notice (denis-vilantis):** This fork of [gotgenes/pi-packages](https://github.com/gotgenes/pi-packages)'s
-> `packages/pi-permission-system` (pinned at the `pi-permission-system-v32.0.4` tag) adds an
+> `packages/pi-permission-system` (synced to the `pi-permission-system-v40.0.0` tag) adds an
 > optional predicate and array support to `shellTools` aliases, so a tool whose input
 > mixes shell and non-shell payloads (for example `ctx_execute` with a `language`
 > argument) is gated through the bash enforcement stack only for shell calls.
@@ -16,7 +16,7 @@
 >   records (for example `ctx_batch_execute`'s `commands: [{ command }]`), the items are
 >   joined with newlines and gated as one multi-line shell program.
 >
-> Everything else is upstream at v32.0.4. Sync by cherry-picking upstream package commits.
+> Everything else is upstream at v40.0.0. Sync by cherry-picking upstream package commits.
 
 ## Building with Nix
 
@@ -66,12 +66,12 @@ Permission enforcement extension for the [Pi](https://pi.mariozechner.at/) codin
 - **Hides disallowed tools** before the agent starts — no wasted turns probing for blocked tools
 - **Enforces allow / ask / deny** at tool-call time with UI confirmation dialogs
 - **Controls bash commands** with wildcard pattern matching (`git *: ask`, `rm -rf *: deny`)
-- **Gates MCP and skill access** at server, tool, and skill-name granularity
+- **Gates MCP and skill access** at server, tool, and skill-name granularity — Pi's built-in MCP tools and the `mcp` proxy alike
 - **Protects sensitive file patterns** — cross-cutting `path` rules deny `.env`, `~/.ssh/*`, etc. across all tools and bash at once, matching both the path as referenced and its symlink-resolved form so a deny cannot be evaded through a symlink alias
 - **Guards external paths** — prompts before file tools or bash commands reach outside `cwd`
 - **Fails closed** — an internal gate error blocks the tool (with a `gate_error` review-log entry and a matching `permissions:decision` broadcast), and a bash command the parser could not resolve, in whole or in part — or an indirection wrapper that hides the gated command (`bash -c`/`eval`, `sudo`, `env`, `xargs`, `find -exec`, …) — prompts (`ask`) rather than passing silently, unless the wrapped command is a pure reader whose direction is provable whatever it is fed (`xargs grep -l foo`); where a partial parse failure's own region re-parses cleanly on its own, the commands and paths it holds are recovered and gated rather than merely prompted for
-- **Forwards prompts from subagents** — `ask` policies work even in non-UI execution contexts
-- **Broadcasts UI prompt events** — `permissions:ui_prompt` fires only when the permission system is about to invoke the active user-facing permission UI, and every prompt it announces — including one forwarded up from a subagent — is answered by a `permissions:decision` on the same bus
+- **Forwards prompts from subagents** — `ask` policies work even in non-UI execution contexts, and a forwarded prompt queues behind whatever dialog is already open instead of replacing it
+- **Broadcasts UI prompt events** — `permissions:ui_prompt` fires only when the permission system is about to invoke the active user-facing permission UI (for a queued ask, when its turn comes rather than when it was raised), and every prompt it announces — including one forwarded up from a subagent — is answered by a `permissions:decision` on the same bus
 - **Native [`@gotgenes/pi-subagents`](https://github.com/gotgenes/pi-subagents) integration** — in-process child sessions register with the permission system automatically, enabling per-agent policy enforcement and `ask`-state forwarding to the parent UI without configuration
 
 ## Install
@@ -116,6 +116,8 @@ All permissions use one of three states:
 
 When the dialog prompts, you can approve once or approve a pattern for the rest of the session.
 In an interactive TUI session the prompt is an inline keybind dialog — `y` approve, `s` approve for this session, `n` deny, `r` deny with a reason — where each hotkey arms and a second press confirms (configurable via `doublePressToConfirm`).
+The hotkeys themselves are remappable through `permissionDialogKeys`, which matters if you type with an input method editor: composition mode swallows letter keys before they reach the terminal, and digits do not.
+Set `promptNotifications` (for example `["bell"]`) and the dialog also rings the terminal as it opens, so a session waiting on you in another tab or pane gets flagged.
 A file-access ask that proves a single direction offers `b` as well, granting the session both directions instead of only the one the gate proved.
 The prompt shows one fact per line — who is asking, the tool, the matched rule, the value being decided — within a row budget, so a large tool input cannot take over the transcript; `Ctrl+O` (`app.tools.expand`) expands it to the complete request.
 See [docs/configuration.md](docs/configuration.md#inline-permission-dialog-tui) for the hotkeys and [docs/session-approvals.md](docs/session-approvals.md) for session-scoped rules and pattern suggestions.
@@ -123,6 +125,7 @@ See [docs/configuration.md](docs/configuration.md#inline-permission-dialog-tui) 
 The `path` surface is a cross-cutting gate that applies to **all** file access — Pi tools, bash commands, MCP calls, and extension tools alike.
 Extension and MCP tools that operate on paths (via `input.path`, MCP's `input.arguments.path`, or a registered access extractor) are gated by default, so a `path` deny cannot be overridden by a per-tool allow — making it the right place to protect sensitive files like `.env` or `~/.ssh/*` from every tool at once.
 A `path` pattern matches both the path as the agent references it and its canonical (symlink-resolved) form, so a deny still fires when a symlink aliases a sensitive target.
+For Pi's built-in file tools, "the path as the agent references it" is the file the tool actually opens: Pi's resolver decodes a `file://` URL, turns Unicode spaces into spaces, and for `read` falls back to macOS's curly-quote and screenshot spellings, so a deny on the file on disk fires however the path was spelled.
 
 For per-tool path patterns (`read`, `write`, `edit`, `find`, `grep`, `ls`), patterns are matched against the file path from `input.path`.
 This lets you express rules like "allow reads but deny `.env` files" at the individual tool level.
@@ -191,7 +194,23 @@ A subagent's ask is reviewed by the chain of the session serving it, one hop up,
 
 For the full reference — all surfaces, runtime knobs, per-agent overrides, merge semantics, and common recipes — see [docs/configuration.md](docs/configuration.md).
 
+## Downstream packages
+
+These packages build on this extension's seams.
+Each one that registers an authorizer link decides nothing until you name it in `authorizerChain`.
+
+- [`@gotgenes/pi-permission-model-judge`](https://www.npmjs.com/package/@gotgenes/pi-permission-model-judge) (first-party): a deny-first model reviewer that auto-denies mistyped out-of-directory paths.
+- [`pi-permission-classifier`](https://github.com/TacoTakumi/pi-permission-classifier) by [@TacoTakumi](https://github.com/TacoTakumi): an auto-approve mode in which a light model reviews each `ask` and returns allow, deny with a short reason, or defer to you; every failure path defers.
+
+Third-party packages are maintained by their authors; review one before granting it a place in your chain.
+
 ## Upgrading
+
+### The major after 36.x — requires Pi 1.0.0
+
+The extension now requires `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` 1.0.0 or later.
+Upgrade Pi to 1.0.0 before upgrading this package; on an older Pi, stay on the 36.x line.
+No configuration change is needed.
 
 ### 22.0.0 — project config requires project trust
 
@@ -232,6 +251,11 @@ Hardening the gates against bypass, fail-closed corrections (breaking ones inclu
 - _Model judgment in the core._
   This package makes no LLM call and holds no model config; model-assisted judging attaches as a chain link over the authorizer seam instead.
   A link decides nothing until you name it in `authorizerChain`, and its `allow` on an excluded surface is downgraded to `defer`.
+- _Supporting a non-Pi host._
+  Built and validated against Pi's extension API and no other: a fork that loads Pi extensions — [Oh My Pi](https://github.com/can1357/oh-my-pi) among them — diverges in payload shape, tool vocabulary, and approval authority, on its own release schedule.
+  Input that violates a contract this package already reads is hardened against anyway, because defensive normalization is correct whoever sent it.
+  Modeling a foreign host's semantics is not, because a guarantee that cannot be executed against is worse than a declined one.
+  This one is conditional rather than permanent — the architecture doc names the five conditions that would make a second host a goal.
 
 The [architecture doc](https://github.com/gotgenes/pi-packages/blob/main/packages/pi-permission-system/docs/architecture/architecture.md#scope-and-non-goals) carries the full inventory, with the decision record behind each entry.
 
@@ -243,27 +267,29 @@ The companion question — whether a capability model replaces the actor-keyed s
 **Where adjacent requests belong.**
 True isolation of a permitted action → an agent sandbox, which this package's scope decisions are exported to rather than duplicated in.
 Model-assisted judging of an `ask` → a chain link over the authorizer seam; [@gotgenes/pi-permission-model-judge](https://www.npmjs.com/package/@gotgenes/pi-permission-model-judge) is the first-party one, and judges mistyped paths.
+A non-Pi host's own payload shapes and tool formats → that host's Pi-compatibility layer, where one fix reaches every Pi extension at once instead of one.
 Approve-and-steer, edit diffs, and risk explanations → a downstream package over the `permissions:decision` event and the presentation seams.
 
 ## Documentation
 
-| Document                                                                                                                       | Contents                                                                                                             |
-| ------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
-| [docs/configuration.md](docs/configuration.md)                                                                                 | Full policy reference, runtime knobs, per-agent overrides, recipes                                                   |
-| [docs/session-approvals.md](docs/session-approvals.md)                                                                         | Session-scoped rules, pattern suggestions, bash arity table                                                          |
-| [docs/cross-extension-api.md](docs/cross-extension-api.md)                                                                     | Cross-extension service accessor, event bus integration, prompt and decision broadcasts                              |
-| [docs/subagent-integration.md](docs/subagent-integration.md)                                                                   | The subagent adapter convention, permission forwarding, coexistence with subagent extensions                         |
-| [docs/guides/permission-frontmatter-for-subagent-extensions.md](docs/guides/permission-frontmatter-for-subagent-extensions.md) | Convention guide for subagent extension authors                                                                      |
-| [docs/opencode-compatibility.md](docs/opencode-compatibility.md)                                                               | OpenCode compatibility — shared concepts, divergences, porting guide                                                 |
-| [docs/troubleshooting.md](docs/troubleshooting.md)                                                                             | Common issues, diagnostic logging, threat model                                                                      |
-| [docs/migration/legacy-to-flat.md](docs/migration/legacy-to-flat.md)                                                           | Migration from pre-v2 config layout                                                                                  |
-| [docs/migration/strict-config-validation.md](docs/migration/strict-config-validation.md)                                       | Strict config validation (breaking) — rejected configs, and the cross-scope fail-closed clamp                        |
-| [docs/migration/0644-project-trust-gating.md](docs/migration/0644-project-trust-gating.md)                                     | Project-trust gating (breaking) — project config loads only after project trust                                      |
-| [docs/migration/0745-prompt-payload-contracts.md](docs/migration/0745-prompt-payload-contracts.md)                             | Prompt payload contracts (breaking) — the forwarded wire, the `ui_prompt` broadcast, and the deprecated preview caps |
-| [docs/migration/0746-review-log-fields.md](docs/migration/0746-review-log-fields.md)                                           | Review-log fields (breaking) — `message` replaced by request facts, and the `reviewLogFieldMaxWidth` bound           |
-| [docs/migration/0794-keyed-service-locator.md](docs/migration/0794-keyed-service-locator.md)                                   | Keyed service locator (breaking) — `getPermissionsService(sessionId)`, and the repeating ready event                 |
-| [docs/migration/0796-remove-process-root-slot.md](docs/migration/0796-remove-process-root-slot.md)                             | Process-root slot removed (breaking) — `getRootPermissionsService()` and its publish/unpublish pair are gone         |
-| [docs/migration/0810-per-pattern-approval-surfaces.md](docs/migration/0810-per-pattern-approval-surfaces.md)                   | Per-pattern approval surfaces (breaking) — `ForwardedSessionApproval.grants` replaces `surface` + `patterns`         |
+| Document                                                                                                                       | Contents                                                                                                                                    |
+| ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| [docs/configuration.md](docs/configuration.md)                                                                                 | Full policy reference, runtime knobs, per-agent overrides, recipes                                                                          |
+| [docs/session-approvals.md](docs/session-approvals.md)                                                                         | Session-scoped rules, pattern suggestions, bash arity table                                                                                 |
+| [docs/cross-extension-api.md](docs/cross-extension-api.md)                                                                     | Cross-extension service accessor, event bus integration, prompt and decision broadcasts                                                     |
+| [docs/subagent-integration.md](docs/subagent-integration.md)                                                                   | The subagent adapter convention, permission forwarding, coexistence with subagent extensions                                                |
+| [docs/guides/permission-frontmatter-for-subagent-extensions.md](docs/guides/permission-frontmatter-for-subagent-extensions.md) | Convention guide for subagent extension authors                                                                                             |
+| [docs/opencode-compatibility.md](docs/opencode-compatibility.md)                                                               | OpenCode compatibility — shared concepts, divergences, porting guide                                                                        |
+| [docs/troubleshooting.md](docs/troubleshooting.md)                                                                             | Common issues, diagnostic logging, threat model                                                                                             |
+| [docs/migration/legacy-to-flat.md](docs/migration/legacy-to-flat.md)                                                           | Migration from pre-v2 config layout                                                                                                         |
+| [docs/migration/strict-config-validation.md](docs/migration/strict-config-validation.md)                                       | Strict config validation (breaking) — rejected configs, and the cross-scope fail-closed clamp                                               |
+| [docs/migration/0644-project-trust-gating.md](docs/migration/0644-project-trust-gating.md)                                     | Project-trust gating (breaking) — project config loads only after project trust                                                             |
+| [docs/migration/0745-prompt-payload-contracts.md](docs/migration/0745-prompt-payload-contracts.md)                             | Prompt payload contracts (breaking) — the forwarded wire, the `ui_prompt` broadcast, and the deprecated preview caps                        |
+| [docs/migration/0746-review-log-fields.md](docs/migration/0746-review-log-fields.md)                                           | Review-log fields (breaking) — `message` replaced by request facts, and the `reviewLogFieldMaxWidth` bound                                  |
+| [docs/migration/0794-keyed-service-locator.md](docs/migration/0794-keyed-service-locator.md)                                   | Keyed service locator (breaking) — `getPermissionsService(sessionId)`, and the repeating ready event                                        |
+| [docs/migration/0796-remove-process-root-slot.md](docs/migration/0796-remove-process-root-slot.md)                             | Process-root slot removed (breaking) — `getRootPermissionsService()` and its publish/unpublish pair are gone                                |
+| [docs/migration/0810-per-pattern-approval-surfaces.md](docs/migration/0810-per-pattern-approval-surfaces.md)                   | Per-pattern approval surfaces (breaking) — `ForwardedSessionApproval.grants` replaces `surface` + `patterns`                                |
+| [docs/migration/0955-pi-infrastructure-read-narrowed.md](docs/migration/0955-pi-infrastructure-read-narrowed.md)               | Pi infrastructure reads narrowed (breaking): only Pi's harness entries under `~/.pi/agent/`, never the logs, and a targeted deny now blocks |
 
 ## Development
 

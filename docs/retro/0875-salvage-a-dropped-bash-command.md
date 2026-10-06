@@ -40,6 +40,7 @@ Committed the plan at `packages/pi-permission-system/docs/plans/0875-salvage-a-d
 - `packages/pi-permission-system/test/access-intent/bash/program.test.ts` — 2093 lines, third-largest test file in the package; the Tidy-First assessor declined a split as scope creep, since the salvage cases fit the file's existing per-issue `describe` convention.
 
 [#393]: https://github.com/gotgenes/pi-packages/issues/393
+[#452]: https://github.com/gotgenes/pi-packages/issues/452
 [#840]: https://github.com/gotgenes/pi-packages/issues/840
 [#899]: https://github.com/gotgenes/pi-packages/issues/899
 
@@ -100,3 +101,71 @@ Re-ran `/sync-worktree 875`: local `main` had advanced by one commit (a `pi-suba
 
 No new observations — this is the "whoever lands second rebases first" case AGENTS.md documents, triggered by an unrelated sibling package's release landing on `main` between sync attempts, not by any conflicting work on this issue.
 Ready for `/ship 875`.
+
+## Stage: Final Retrospective (2026-09-16T04:28:26Z)
+
+### Session summary
+
+Shipped #875 through the worktree lane: fast-forwarded eleven commits onto `main`, verified CI, closed the issue with a three-SHA close comment, and released `pi-permission-system-v32.0.4`.
+The ship session itself ran 38 tool calls with zero corrections and zero rework — every prompt step executed once.
+The retrospective below spans all four stages (planning, TDD, two sync runs, ship), since the friction worth recording is concentrated upstream of the ship.
+
+### Observations
+
+#### What went well
+
+- **The pre-completion reviewer refuted a claim the plan had measured and asserted.**
+  The plan's Invariants table discharged the [#452] zero-unit row with "no such shape exists (measured — the one zero-unit-shaped candidate is root-only)".
+  The reviewer produced `> f <<'M' 2>&1 | rm -rf /tmp/x` — a body-less leading redirect, valid bash that really runs — which yields zero primary units and one salvaged one, turning a context-naming `deny` into `ask`.
+  This is the single highest-value event across the four stages: an adversarial fresh-context read overturned a conclusion backed by a 6911-command corpus measurement.
+- **Killing-mutation verification earned its cost twice over, and both times as a finding rather than a pass.**
+  The plan's step-4 mutation (`node.type === "file_redirect"`) left the entire suite green across 25 probed spellings of the grammar gap, so the rule was re-pinned with a stub-node test instead.
+  The plan's `cd /outside && … cat rel.txt` probe was vacuous — a bare token needs the existence probe under either base — and was replaced with `cat ../secret`, whose `..` shape discriminates.
+  Neither would have surfaced from the Red step's own evidence.
+- **Planning measured rather than argued, and found a fourth remedy.**
+  Re-parsing the smallest unresolved node standalone appears in neither the issue nor ADR 0013's 2026-09-04 amendment, both of which enumerate the same three directions.
+  Probing the clean-re-parse guard in the **absent** direction (dropping it emits `">"` and `"$(("` as command units) is what made the Risks section evidence rather than assertion.
+- **`/ship`'s step 2 worked exactly as designed.**
+  Reading the plan's `**Release:** ship independently` marker and the full retro off the branch — before any irreversible action — meant the release decision needed no operator gate and no close target was missed.
+
+#### What caused friction (agent side)
+
+- `instruction-violation` (self-identified) — during TDD, an `Edit` was addressed to `/Users/chris/development/pi/pi-permission-system/src/access-intent/bash/unresolved-salvage.ts`, a hand-built absolute path missing the `pi-packages-worktrees/issue-875/packages/` segment.
+  `AGENTS.md` states the rule verbatim ("Pass file tool paths repo-relative … a mistyped absolute path trips the `external_directory` gate instead of failing fast", Refs #726).
+  Impact: one rejected tool call; the next call used a repo-relative path and succeeded.
+  Self-identified, so this is a salience issue rather than a missing rule — no change proposed.
+- `other` — a `git commit -F -` fed from a heredoc whose body itself contained `<<'MSG'` failed, after the identical construction had succeeded for the previous commit.
+  Impact: two tool calls (write `/tmp/msg2.txt`, re-commit); every later commit in the session used `-F <file>`.
+  `AGENTS.md` says such a body "belongs in a file passed with `-F`", which `-F -` reads as satisfying.
+- `other` — a disposable spike test's `console.log` output did not survive the vitest reporter, costing two tool calls in planning before the probe was rewritten to `writeFileSync("/tmp/probe875-out.txt", …)`.
+  The TDD stage reached for `writeFileSync` immediately, so the lesson transferred within the issue but is not written down anywhere.
+  Impact: two calls, no rework.
+- `other` — the second `/sync-worktree` run appended a **full** second `## Stage: Sync (worktree)` block, after the session had stated it would annotate the existing entry instead.
+  Impact: cosmetic — the retro carries two sync entries whose content largely overlaps.
+  The prompt's step 3 says "Append a stage entry" unconditionally and says nothing about a re-run, which the same prompt elsewhere treats as expected.
+
+#### What caused friction (user side)
+
+- **An unrelated `pi-subagents` release landed on `main` between the peer's first and second `/sync-worktree` runs**, invalidating a completed rebase and forcing a full re-sync — two `pnpm run lint` + `pnpm fallow dead-code` cycles and roughly eight tool calls.
+  `AGENTS.md` already records the rule ("Land a pending worktree branch before committing unrelated work to `main`"), so this is an application gap rather than a documentation one.
+  Worth noting as the concrete cost of the ordering: the peer had already reported a clean handoff once.
+- The peer session recovered from it correctly and without prompting — it diagnosed the failed `git merge-base --is-ancestor` rather than assuming a stale check — so no intervention was needed, only the re-run.
+
+### Diagnostic details
+
+- **Model-performance correlation** — planning and TDD ran on `anthropic/claude-opus-5` (judgment-heavy: corpus measurement, a remedy neither prior record listed, mutation triage); both sync runs and the ship ran on `anthropic/claude-sonnet-5` (deterministic prompt execution); this retrospective runs on `anthropic/claude-opus-5`.
+  No mismatch: the two subagent dispatches (`tidy-first-assessor`, `pre-completion-reviewer` ×2) carried the reviewing judgment, and the reviewer's round-1 FAIL is direct evidence its model was adequate.
+- **Escalation-delay tracking** — no `rabbit-hole` friction points; no sequence exceeded two consecutive tool calls on the same error.
+- **Unused-tool detection** — not applicable; no `rabbit-hole` or `missing-context` points to check.
+- **Feedback-loop gap analysis** — verification ran incrementally throughout: `pnpm run check` after each interface-touching Green step, the affected test files after every Red and Green, and full `check`/`lint`/`test`/`fallow` at the end of each of the six commits.
+  The ship stage re-ran `lint` and `fallow` on the post-merge tree per `/ship` step 5, catching the gap `/sync-worktree`'s pre-rebase checks leave.
+  No gaps found.
+
+### Changes made
+
+1. `.pi/prompts/plan-issue.md` — added a bullet line to `**Invariants at risk**`: an invariant discharged by "no input of this shape exists" is unproven, because a corpus bounds observed frequency rather than reachability.
+   Written from this issue's [#452] row, which the pre-completion reviewer refuted with a shape the 6911-command corpus did not contain.
+2. `.pi/prompts/sync-worktree.md` — step 3 now says a re-run appends a dated line to the existing entry instead of a second `## Stage: Sync (worktree)` block.
+3. `AGENTS.md` — tightened the commit-body rule to `-F <file>`, explicitly excluding `-F -` from a heredoc, and split it into two sentences.
+4. Declined: a `testing`-skill note about spike tests reporting through a file rather than `console.log`.
+   The vitest cause was never re-derived, so the evidence did not support a rule.

@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { ARG_NODE_TYPES } from "#src/access-intent/bash/node-text";
-import { getParser, type TSNode } from "#src/access-intent/bash/parser";
+import { getGrammarParser, type TSNode } from "#src/access-intent/bash/parser";
 import {
   redirectEffectForDestination,
   redirectMayWriteFile,
+  redirectTargetIndex,
+  trailingArgumentIndex,
 } from "#src/access-intent/bash/redirect-analysis";
 import type { TokenEffect } from "#src/access-intent/effect";
 
@@ -25,13 +27,16 @@ function findNodes(node: TSNode, type: string, out: TSNode[] = []): TSNode[] {
  * A command can carry several, and an unresolvable one does not contaminate a
  * resolvable neighbour — so a test asserting that needs the whole list from one
  * parse, not the first match.
+ *
+ * Parsed by the grammar's own parser: this module reads a redirect node as
+ * `tree-sitter-bash` produced it, words after its target included.
  */
 async function withRedirects<T>(
   command: string,
   type: string,
   read: (redirects: TSNode[]) => T,
 ): Promise<T> {
-  const parser = await getParser();
+  const parser = await getGrammarParser();
   const tree = parser.parse(command);
   if (!tree) throw new Error("parser.parse returned null");
   try {
@@ -274,6 +279,106 @@ describe("redirectMayWriteFile", () => {
       ["cat <>&1", "a read-write open naming no argument-shaped destination"],
     ])("answers true for %s (%s)", async (command) => {
       await expect(mayWrite(command)).resolves.toBe(true);
+    });
+  });
+});
+
+describe("redirectTargetIndex", () => {
+  /** The text of the child `redirectTargetIndex` names, or `undefined`. */
+  function targetText(command: string): Promise<string | undefined> {
+    return withRedirect(command, "file_redirect", (redirect) => {
+      const index = redirectTargetIndex(redirect);
+      return index === undefined ? undefined : redirect.child(index)?.text;
+    });
+  }
+
+  it("names the destination of a plain redirect", async () => {
+    await expect(targetText("cat a > out.txt")).resolves.toBe("out.txt");
+  });
+
+  it("names the destination rather than the descriptor ahead of the operator", async () => {
+    await expect(targetText("pnpm x 2> err.log")).resolves.toBe("err.log");
+  });
+
+  it("names only the first destination when words follow it", async () => {
+    // tree-sitter-bash parses `f.txt` as a second destination; bash passes it
+    // to `grep` as an argument.
+    await expect(targetText("grep pat 2>/dev/null f.txt")).resolves.toBe(
+      "/dev/null",
+    );
+  });
+
+  it("names the duplicated descriptor of a duplication", async () => {
+    await expect(targetText("pnpm x 2>&1")).resolves.toBe("1");
+  });
+
+  it("names nothing for a redirect that closes a descriptor", async () => {
+    await expect(targetText("echo hi >&-")).resolves.toBeUndefined();
+  });
+
+  it.each(["cmd >&- arg", "cmd <&- arg"])(
+    "names nothing for %s, whose word belongs to the command",
+    async (command) => {
+      // The grammar reads the word as the close operator's destination; the
+      // operator closes a descriptor and names no file, so bash passes `arg`
+      // to the command.
+      await expect(targetText(command)).resolves.toBeUndefined();
+    },
+  );
+});
+
+describe("trailingArgumentIndex", () => {
+  /** The text of the child `trailingArgumentIndex` names, or `undefined`. */
+  function trailingText(
+    command: string,
+    type = "file_redirect",
+  ): Promise<string | undefined> {
+    return withRedirect(command, type, (redirect) => {
+      const index = trailingArgumentIndex(redirect);
+      return index === undefined ? undefined : redirect.child(index)?.text;
+    });
+  }
+
+  describe("a redirect the grammar hung the command's words on", () => {
+    it.each([
+      ["grep pat 2>/dev/null f.txt", "f.txt"],
+      ["find ~/x 2>/dev/null -delete -print", "-delete"],
+      ["pnpm x 2>&1 arg", "arg"],
+      ["cmd >&- arg", "arg"],
+      ["cmd <&- arg", "arg"],
+    ])("names the first word after the target in %s", async (command, text) => {
+      await expect(trailingText(command)).resolves.toBe(text);
+    });
+  });
+
+  describe("a redirect with nothing after its target", () => {
+    it.each(["cat a > out.txt", "pnpm x 2>&1", "echo hi >&-"])(
+      "names nothing for %s",
+      async (command) => {
+        await expect(trailingText(command)).resolves.toBeUndefined();
+      },
+    );
+  });
+
+  describe("a heredoc the grammar hung the command's words on", () => {
+    it.each([
+      ["git <<EOF push --force\nb\nEOF", "push"],
+      ['cat <<EOF $(rm x) "q s"\nb\nEOF', "$(rm x)"],
+    ])(
+      "names the first word after the delimiter in %j",
+      async (command, text) => {
+        await expect(trailingText(command, "heredoc_redirect")).resolves.toBe(
+          text,
+        );
+      },
+    );
+
+    it("names nothing for a heredoc whose line ends at the delimiter", async () => {
+      // The body follows the delimiter as the next named child, and it is not
+      // a word of the command.
+      await expect(
+        trailingText("cat <<EOF\nb\nEOF", "heredoc_redirect"),
+      ).resolves.toBeUndefined();
     });
   });
 });

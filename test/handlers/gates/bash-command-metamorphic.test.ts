@@ -10,15 +10,19 @@
  * full fuzzer (tree-sitter fuzzing is brittle); it pins A3 directly.
  */
 import { describe, expect, it } from "vitest";
+import { BashPathResolver } from "#src/access-intent/bash/bash-path-resolver";
 import { collectCommands } from "#src/access-intent/bash/command-enumeration";
+import { WordReader } from "#src/access-intent/bash/node-text";
 import { getParser } from "#src/access-intent/bash/parser";
 import { BashProgram } from "#src/access-intent/bash/program";
+import { ShellVariables } from "#src/access-intent/bash/shell-variable-expansion";
 import { resolveBashCommandCheck } from "#src/handlers/gates/bash-command";
 import { pathFlavorForPlatform } from "#src/path/path-flavor";
 import { PathNormalizer } from "#src/path/path-normalizer";
 import type { ScopedPermissionResolver } from "#src/policy/permission-resolver";
 import type { PermissionState } from "#src/types";
 
+import { bashCommandOf } from "#test/helpers/gate-fixtures";
 import { makeCheckResult } from "#test/helpers/handler-fixtures";
 
 /** Decision strength ordering: deny (2) > ask (1) > allow (0). */
@@ -37,13 +41,32 @@ function makeKeyedResolver(
 ): ScopedPermissionResolver {
   return {
     resolve: (intent) => {
-      const command =
-        intent.kind === "tool"
-          ? ((intent.input as { command?: string }).command ?? "")
-          : "";
+      const command = bashCommandOf(intent) ?? "";
       const rule = rules.find((r) => command.includes(r.match));
       const state: PermissionState = rule?.state ?? "allow";
       return makeCheckResult({ state, source: "bash", command });
+    },
+  };
+}
+
+/**
+ * Resolver modelling a `<prefix> *` rule: a command that *starts with* the
+ * prefix resolves to `state`, and anything else to allow (the permissive
+ * top-level `*`). Unlike a substring match, a wrapper's own text never matches
+ * the rule for the command it runs.
+ */
+function makePrefixResolver(
+  prefix: string,
+  state: PermissionState,
+): ScopedPermissionResolver {
+  return {
+    resolve: (intent) => {
+      const command = bashCommandOf(intent) ?? "";
+      return makeCheckResult({
+        state: command.startsWith(prefix) ? state : "allow",
+        source: "bash",
+        command,
+      });
     },
   };
 }
@@ -62,6 +85,23 @@ async function decide(
     undefined,
     resolver,
   ).state;
+}
+
+/**
+ * Whether `unit`'s whitespace-separated words appear in `command`, in order:
+ * the unit is the command with zero or more whole spans left out.
+ *
+ * Each word is found as a substring rather than as one of the command's own
+ * words, because an operator can abut a word (`rm $f;`).
+ */
+function isWordSubsequence(unit: string, command: string): boolean {
+  let next = 0;
+  for (const word of unit.split(/\s+/)) {
+    const found = command.indexOf(word, next);
+    if (found === -1) return false;
+    next = found + word.length;
+  }
+  return true;
 }
 
 describe("bash command gate — metamorphic totality", () => {
@@ -150,6 +190,88 @@ describe("bash command gate — nested execution hosts do not weaken", () => {
 });
 
 /**
+ * Where a redirect sits in a simple command does not change which command runs,
+ * so moving it must not weaken a rule anchored on the command's own words.
+ *
+ * The resolver models a `<prefix> *` rule: it matches a unit that *starts with*
+ * the prefix, which is what a redirect's text or a dropped word defeats. A
+ * substring match would find `git` in `2>/dev/null git push` and prove nothing.
+ */
+describe("bash command gate — a redirect's position does not weaken", () => {
+  const placements: {
+    label: string;
+    place: (head: string, rest: string) => string;
+  }[] = [
+    { label: "before the command", place: (h, r) => `2>/dev/null ${h} ${r}` },
+    {
+      label: "between a prefix assignment and the command",
+      place: (h, r) => `FOO=1 >/dev/null ${h} ${r}`,
+    },
+    {
+      label: "as a herestring after the head word",
+      place: (h, r) => `${h} <<< x ${r}`,
+    },
+    {
+      label: "after the head word",
+      place: (h, r) => `${h} 2>/dev/null ${r}`,
+    },
+    {
+      label: "between the arguments",
+      place: (h, r) => {
+        const [first = "", ...others] = r.split(" ");
+        return `${h} ${first} 2>&1 ${others.join(" ")}`;
+      },
+    },
+    {
+      label: "after the head word of a list's last command",
+      place: (h, r) => `cd a && ${h} 2>/dev/null ${r}`,
+    },
+    {
+      label: "as a heredoc after the head word",
+      place: (h, r) => `${h} <<EOF ${r}\nbody\nEOF`,
+    },
+    {
+      label: "as a heredoc after the head word of a list's last command",
+      place: (h, r) => `cd a && ${h} <<EOF ${r}\nbody\nEOF`,
+    },
+    {
+      label: "as a heredoc piped into the command",
+      place: (h, r) => `cat <<EOF | ${h} ${r}\nbody\nEOF`,
+    },
+    {
+      label: "as a heredoc joined to the command by &&",
+      place: (h, r) => `cat <<EOF && ${h} ${r}\nbody\nEOF`,
+    },
+    {
+      label: "as a heredoc writing a file before the command",
+      place: (h, r) => `cat <<EOF > /tmp/o && ${h} ${r}\nbody\nEOF`,
+    },
+  ];
+
+  const cases: {
+    head: string;
+    rest: string;
+    prefix: string;
+    state: PermissionState;
+  }[] = [
+    { head: "git", rest: "push --force", prefix: "git push", state: "deny" },
+    { head: "rm", rest: "-rf build", prefix: "rm -rf", state: "deny" },
+    { head: "gh", rest: "pr create", prefix: "gh pr", state: "ask" },
+  ];
+
+  for (const { label, place } of placements) {
+    for (const { head, rest, prefix, state } of cases) {
+      it(`a redirect ${label} leaves "${head} ${rest}" at ${state}`, async () => {
+        const resolver = makePrefixResolver(prefix, state);
+
+        expect(await decide(`${head} ${rest}`, resolver)).toBe(state);
+        expect(await decide(place(head, rest), resolver)).toBe(state);
+      });
+    }
+  }
+});
+
+/**
  * The same never-weaker property for wrapper transparency (#803).
  *
  * An exempt wrapper resolves by its inner command's own rule instead of the
@@ -229,6 +351,82 @@ describe("bash command gate — a transparent wrapper does not weaken", () => {
 });
 
 /**
+ * A wrapper that changes only *how* a command runs — `time`, `timeout`, `nice`,
+ * `stdbuf`, `setsid` — is decided exactly as the command it runs (#963).
+ *
+ * Stronger than the never-weaker property above: the wrapped decision must
+ * *equal* the bare one, in both directions, so an inner `deny` reaches through
+ * the wrapper and an inner `allow` is not floored.
+ */
+describe("bash command gate — an execution modifier inherits the verdict", () => {
+  const modifiers = [
+    (cmd: string) => `time ${cmd}`,
+    (cmd: string) => `timeout 5 ${cmd}`,
+    (cmd: string) => `nice -n 5 ${cmd}`,
+    (cmd: string) => `stdbuf -oL ${cmd}`,
+    (cmd: string) => `setsid ${cmd}`,
+    (cmd: string) => `time timeout 5 ${cmd}`,
+  ];
+
+  const cases: { bare: string; prefix: string; state: PermissionState }[] = [
+    { bare: "pnpm test", prefix: "pnpm", state: "allow" },
+    { bare: "pnpm test", prefix: "pnpm", state: "ask" },
+    { bare: "pnpm test", prefix: "pnpm", state: "deny" },
+    { bare: "git push --force", prefix: "git push", state: "deny" },
+  ];
+
+  for (const wrap of modifiers) {
+    for (const { bare, prefix, state } of cases) {
+      it(`decides "${wrap(bare)}" as "${bare}" at ${state}`, async () => {
+        const resolver = makePrefixResolver(prefix, state);
+
+        expect(await decide(bare, resolver)).toBe(state);
+        expect(await decide(wrap(bare), resolver)).toBe(state);
+      });
+    }
+  }
+
+  it("allows the timed lint run that prompted the issue", async () => {
+    const command =
+      'time pnpm run lint >/tmp/lintout.txt 2>&1; echo "lint rc=$?"; tail -3 /tmp/lintout.txt';
+
+    expect(await decide(command, makeKeyedResolver([]))).toBe("allow");
+  });
+
+  it("keeps an explicit ask on the wrapper", async () => {
+    const resolver = makePrefixResolver("time", "ask");
+
+    expect(await decide("time pnpm test", resolver)).toBe("ask");
+  });
+
+  // The wrapper's text never matches the `rm *` rule, so only the floor stands
+  // between these and a permissive `*`: each must ask, never allow.
+  it.each([
+    "timeout --sig KILL 5 rm -rf /",
+    "nice --adj 5 rm -rf /",
+    "time sudo rm -rf x",
+    "time { rm -rf /tmp/x; }",
+    "time (rm -rf /tmp/x)",
+    "timeout 5 bash -c 'rm x'",
+    "timeout -- 5 sudo rm x",
+    "timeout -s KILL -- 5 bash -c 'rm x'",
+    "nice -n 1 -- timeout -- 5 sudo rm x",
+    "timeout {5,sudo} rm x",
+    // `D="5 sudo"` splits into a duration and a wrapper the gate never sees.
+    "timeout $D pnpm test",
+    "nice -n $N pnpm test",
+    "timeout $(echo 5 sudo) rm x",
+  ])(
+    "floors %s rather than resolving a misread inner command",
+    async (command) => {
+      const resolver = makePrefixResolver("rm", "deny");
+
+      expect(await decide(command, resolver)).toBe("ask");
+    },
+  );
+});
+
+/**
  * The fail-closed property for a parse tree-sitter could not resolve (#840).
  *
  * ADR 0013 §10's last combinator clause — any unhandled node type fails closed
@@ -253,6 +451,29 @@ describe("bash command gate — a parse it could not resolve fails closed", () =
       label: "the same shape piping into a mutator",
       command:
         "git add -A . && git commit -F - <<'MSG' 2>&1 | rm -rf /tmp/x\nmsg\nMSG",
+    },
+    // Valid bash whose heredoc tail the grammar cannot parse at all: the
+    // salvage recovers the command after the heredoc from the line's
+    // heredoc-free spelling.
+    {
+      label: "a heredoc followed by `;`",
+      command: "cat <<EOF ; rm -rf /tmp/x\nb\nEOF",
+    },
+    {
+      label: "a heredoc followed by `&`",
+      command: "cat <<EOF & rm -rf /tmp/x\nb\nEOF",
+    },
+    {
+      label: "a heredoc followed by words and a redirect",
+      command: "cat <<EOF arg > /tmp/o\nb\nEOF",
+    },
+    {
+      label: "a descriptor the grammar lexed into the delimiter",
+      command: "cat 0<<EOF | rm -rf /tmp/x\nb\nEOF",
+    },
+    {
+      label: "a heredoc tail inside a compound statement",
+      command: "if true; then cat <<EOF ; rm -rf /tmp/x\nb\nEOF\nfi",
     },
     // Malformed input, which the shell itself refuses to run. Covered because
     // the clause is about the parse, not about what bash would accept.
@@ -338,7 +559,15 @@ describe("bash command gate — a parse it could not resolve fails closed", () =
       const tree = parser.parse(command);
       if (!tree) throw new Error("parse returned null");
       try {
-        return collectCommands(tree.rootNode);
+        // The primary parse alone, spelled as the program spells it: the
+        // resolver walking only the primary tree records the same argument
+        // spellings, since a salvaged fragment's tokens are never spelled.
+        const words = new WordReader(ShellVariables.UNREBOUND);
+        const { argumentSpellings } = new BashPathResolver(
+          normalizer,
+          words,
+        ).resolve(tree.rootNode);
+        return collectCommands(tree.rootNode, words, argumentSpellings);
       } finally {
         tree.delete();
       }
@@ -358,14 +587,18 @@ describe("bash command gate — a parse it could not resolve fails closed", () =
     );
 
     it.each([...unresolved.map(({ command }) => command), ...resolved])(
-      "emits no unit whose text the command does not contain, for %s",
+      "emits no unit whose words are not the command's words, in order, for %s",
       async (command) => {
-        // Anti-invention: every unit's text is sliced from a parse of the
-        // command's own source, salvaged or not. Recovery's invented structure
-        // is refused a step earlier, when its re-parse fails.
+        // Anti-invention: every unit is built from a parse of the command's own
+        // source, salvaged or not, with at most whole spans left out: a
+        // redirect or heredoc between a command's words is not part of its
+        // unit. So its words are the command's words, in order. Recovery's
+        // invented structure is refused a step earlier, when its re-parse fails.
         const units = (await BashProgram.parse(command, normalizer)).commands();
 
-        expect(units.filter(({ text }) => !command.includes(text))).toEqual([]);
+        expect(
+          units.filter(({ text }) => !isWordSubsequence(text, command)),
+        ).toEqual([]);
       },
     );
 

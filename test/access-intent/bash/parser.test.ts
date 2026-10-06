@@ -1,13 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  getGrammarParser,
   getParser,
   getWarmBashParser,
-  parseUnresolvedAt,
-  parseUnresolvedWithin,
   resetWarmBashParser,
-  type TSNode,
   warmBashParser,
 } from "#src/access-intent/bash/parser";
+import { shape } from "#test/helpers/bash-parse-tree";
 
 describe("getParser", () => {
   it("parses a simple bash command and returns a non-null root node", async () => {
@@ -24,6 +23,125 @@ describe("getParser", () => {
     const second = await getParser();
     expect(first).toBe(second);
   });
+});
+
+describe("getGrammarParser", () => {
+  it("returns the same memoized parser instance on repeated calls", async () => {
+    const first = await getGrammarParser();
+    const second = await getGrammarParser();
+    expect(first).toBe(second);
+  });
+});
+
+describe("the words after a redirect's target", () => {
+  /** The named child types under the first statement of `command`'s parse. */
+  async function firstStatement(
+    parser: Awaited<ReturnType<typeof getParser>>,
+    command: string,
+  ): Promise<string[]> {
+    const tree = parser.parse(command);
+    if (!tree) throw new Error("parser.parse returned null");
+    try {
+      const statement = tree.rootNode.child(0);
+      const types = [statement?.type ?? ""];
+      for (let i = 0; i < (statement?.childCount ?? 0); i++) {
+        const child = statement?.child(i);
+        if (child?.isNamed) types.push(child.type);
+      }
+      return types;
+    } finally {
+      tree.delete();
+    }
+  }
+
+  it("are the command's own words through getParser", async () => {
+    await expect(
+      firstStatement(await getParser(), "git 2>/dev/null push --force"),
+    ).resolves.toEqual([
+      "command",
+      "command_name",
+      "file_redirect",
+      "word",
+      "word",
+    ]);
+  });
+
+  it("stay on the redirect through getGrammarParser", async () => {
+    await expect(
+      firstStatement(await getGrammarParser(), "git 2>/dev/null push --force"),
+    ).resolves.toEqual(["redirected_statement", "command", "file_redirect"]);
+  });
+
+  it("are the command's own words after a heredoc, through getParser", async () => {
+    await expect(
+      firstStatement(await getParser(), "git <<EOF push --force\nb\nEOF"),
+    ).resolves.toEqual([
+      "command",
+      "command_name",
+      "heredoc_redirect",
+      "word",
+      "word",
+    ]);
+  });
+
+  it("join a piped statement after a heredoc, through getParser", async () => {
+    await expect(
+      firstStatement(await getParser(), "cat <<EOF | rm -rf /tmp/x\nb\nEOF"),
+    ).resolves.toEqual(["pipeline", "redirected_statement", "command"]);
+  });
+
+  it("stay in the heredoc through getGrammarParser", async () => {
+    await expect(
+      firstStatement(
+        await getGrammarParser(),
+        "cat <<EOF | rm -rf /tmp/x\nb\nEOF",
+      ),
+    ).resolves.toEqual(["redirected_statement", "command", "heredoc_redirect"]);
+  });
+});
+
+describe("the rest of a heredoc's line, through getParser", () => {
+  /** `command`'s corrected shape, with its redirect rendered as `redirect`. */
+  async function correctedShape(
+    command: string,
+    redirect: string,
+  ): Promise<string> {
+    const parser = await getParser();
+    const tree = parser.parse(command);
+    if (!tree) throw new Error("parser.parse returned null");
+    try {
+      return shape(tree.rootNode).replace(redirect, "REDIRECT");
+    } finally {
+      tree.delete();
+    }
+  }
+
+  it.each([
+    "git <<EOF push --force",
+    "cat <<EOF ~/x/in",
+    "cat <<EOF > /tmp/o",
+    "cat <<EOF 2>/dev/null arg",
+    "cat <<EOF | rm -rf /tmp/x",
+    "cat <<EOF && rm -rf /tmp/x",
+    "cat <<EOF > a && rm x",
+    "cat <<EOF | a && cd /tmp",
+    "x && git <<EOF 2>/dev/null push",
+  ])(
+    "reaches what the same line with `< in` in place of `<<EOF` reaches: %s",
+    async (line) => {
+      await expect(
+        correctedShape(
+          `${line}\nb\nEOF`,
+          '(heredoc_redirect "EOF" "b\\n" "EOF")',
+        ),
+      ).resolves.toBe(
+        await correctedShape(
+          line.replace("<<EOF", "< in"),
+          '(file_redirect "in")',
+        ),
+      );
+    },
+  );
 });
 
 describe("warm parser", () => {
@@ -57,190 +175,5 @@ describe("warm parser", () => {
     expect(getWarmBashParser()).not.toBeNull();
     resetWarmBashParser();
     expect(getWarmBashParser()).toBeNull();
-  });
-});
-
-// ── parseUnresolvedAt ────────────────────────────────────────────────
-
-/** Depth-first collection of every node of the given type, in source order. */
-function findNodes(node: TSNode, type: string, out: TSNode[] = []): TSNode[] {
-  if (node.type === type) out.push(node);
-  for (let i = 0; i < node.childCount; i++) {
-    const child = node.child(i);
-    if (child) findNodes(child, type, out);
-  }
-  return out;
-}
-
-/**
- * `parseUnresolvedAt` applied to each `file_redirect` a command carries.
- *
- * The subject is the shape tree-sitter really produces for these commands, so
- * the fixtures are parsed rather than fabricated — the whole point is where
- * error recovery puts the text it could not attach.
- */
-async function unresolvedRedirects(command: string): Promise<boolean[]> {
-  const parser = await getParser();
-  const tree = parser.parse(command);
-  if (!tree) throw new Error("parser.parse returned null");
-  try {
-    return findNodes(tree.rootNode, "file_redirect").map(parseUnresolvedAt);
-  } finally {
-    tree.delete();
-  }
-}
-
-describe("parseUnresolvedAt", () => {
-  describe("a node tree-sitter could not resolve", () => {
-    it("answers true when the discarded text is inside the node", async () => {
-      // `<>` has no node in the grammar; here the `>` half is recovered as an
-      // `ERROR` child of the redirect itself.
-      await expect(unresolvedRedirects("cat <> rw.txt")).resolves.toEqual([
-        true,
-      ]);
-    });
-
-    it("answers true when the discarded text is the preceding sibling", async () => {
-      // Same command, tilde destination: the `<` half is recovered as an
-      // `ERROR` *before* an otherwise clean `file_redirect "> ~/rw.txt"`, so
-      // nothing inside that node distinguishes it from a genuine write.
-      await expect(unresolvedRedirects("cat <> ~/rw.txt")).resolves.toEqual([
-        true,
-      ]);
-    });
-
-    it.each(["cat 3<> rw.txt", "cat 0<> ~/y", "cat <>&1"])(
-      "answers true for %s",
-      async (command) => {
-        await expect(unresolvedRedirects(command)).resolves.toContain(true);
-      },
-    );
-
-    it.each(["cat $(( > out.txt", "echo ) > out.txt"])(
-      "answers true for %s, whose redirect is itself well-formed",
-      async (command) => {
-        // The question is about the parse, not about `<>`. A redirect preceded
-        // by an unrelated recovery failure loses its proof too — the accepted
-        // cost, pinned here so the wider population is deliberate rather than
-        // incidental. Over-refusing costs a prompt; under-refusing hands a
-        // write to a read grant.
-        await expect(unresolvedRedirects(command)).resolves.toEqual([true]);
-      },
-    );
-  });
-
-  describe("a node tree-sitter resolved", () => {
-    it.each([
-      "cat a > out.txt",
-      "cat < in.txt",
-      "pnpm x 2>&1",
-      "pnpm x >& out.txt",
-      "cat a > $(mktemp)",
-      "foo; cat a > out.txt",
-    ])("answers false for %s", async (command) => {
-      await expect(unresolvedRedirects(command)).resolves.toEqual([false]);
-    });
-  });
-
-  describe("a command mixing resolved and unresolved redirects", () => {
-    it("answers per redirect rather than per statement", async () => {
-      // Three sibling `file_redirect` nodes: the genuine `> out.txt`, the
-      // stranded `<`, and the `> ~/rw.txt` the `<` was meant to pair with. A
-      // statement-wide rule would condemn the first, which really is a write.
-      await expect(
-        unresolvedRedirects("cat a > out.txt <> ~/rw.txt"),
-      ).resolves.toEqual([false, true, true]);
-    });
-
-    it("leaves a resolvable redirect after an unresolvable one proven", async () => {
-      await expect(
-        unresolvedRedirects("cat <> ~/a.txt > b.txt"),
-      ).resolves.toEqual([true, false]);
-    });
-  });
-});
-
-// ── parseUnresolvedWithin ────────────────────────────────────────────
-
-/** `parseUnresolvedWithin` applied to each `type` node a command produces. */
-async function unresolvedWithin(
-  command: string,
-  type: string,
-): Promise<boolean[]> {
-  const parser = await getParser();
-  const tree = parser.parse(command);
-  if (!tree) throw new Error("parser.parse returned null");
-  try {
-    return findNodes(tree.rootNode, type).map(parseUnresolvedWithin);
-  } finally {
-    tree.delete();
-  }
-}
-
-describe("parseUnresolvedWithin", () => {
-  describe("a node whose own subtree carries the failure", () => {
-    it("answers true when the discarded text is inside the node", async () => {
-      // `<>` has no node in the grammar; the `>` half is recovered as an
-      // `ERROR` child of the redirect itself.
-      await expect(
-        unresolvedWithin("cat <> rw.txt", "file_redirect"),
-      ).resolves.toEqual([true]);
-    });
-
-    it("answers true for a statement whose failure is several levels down", async () => {
-      // The `ERROR` sits under `heredoc_redirect → file_redirect`; the
-      // statement is what a walker descending statements can see it through.
-      await expect(
-        unresolvedWithin(
-          "git commit -F - <<'MSG' 2>&1 | tail -4\nmsg\nMSG",
-          "redirected_statement",
-        ),
-      ).resolves.toEqual([true]);
-    });
-  });
-
-  describe("a node whose predecessor carried the failure", () => {
-    it("answers false where parseUnresolvedAt answers true", async () => {
-      // The one case that separates the two predicates. Here the `<` half is
-      // recovered as an `ERROR` *before* an otherwise clean
-      // `file_redirect "> ~/rw.txt"`. A redirect must refuse on that, because
-      // error recovery strands the discarded operator ahead of the node it
-      // belonged to — but a statement whose predecessor failed is not itself
-      // unparsed, so the subtree-only question is the one a walker asks.
-      await expect(
-        unresolvedWithin("cat <> ~/rw.txt", "file_redirect"),
-      ).resolves.toEqual([false]);
-      await expect(unresolvedRedirects("cat <> ~/rw.txt")).resolves.toEqual([
-        true,
-      ]);
-    });
-  });
-
-  describe("a fully resolved parse", () => {
-    it.each(["cat a > out.txt", "cd /repo && git push", "echo hi | tail -2"])(
-      "answers false at every level of %s",
-      async (command) => {
-        await expect(unresolvedWithin(command, "program")).resolves.toEqual([
-          false,
-        ]);
-        await expect(
-          unresolvedWithin(command, "command"),
-        ).resolves.not.toContain(true);
-      },
-    );
-  });
-
-  describe("the root of a partially failed parse", () => {
-    it("answers true for the program node however local the failure", async () => {
-      // Why a walker cannot ask this of `program`, `list`, or `pipeline`: the
-      // answer is true whenever anything anywhere failed, so marking there
-      // would mark every unit of the command.
-      await expect(
-        unresolvedWithin(
-          "echo hi > out.txt <> rw.txt; rm -rf /tmp/y",
-          "program",
-        ),
-      ).resolves.toEqual([true]);
-    });
   });
 });

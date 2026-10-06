@@ -5,6 +5,14 @@
   "permissionReviewLog": true,
   "yoloMode": false,
   "doublePressToConfirm": true,
+  "permissionDialogKeys": {
+    "approve": "y",
+    "approveSession": "s",
+    "approveSessionBoth": "b",
+    "deny": "n",
+    "denyWithReason": "r"
+  },
+  "promptNotifications": [],
 
   "forwardingTimeoutMs": 600000,
 

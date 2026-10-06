@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
+import type { ArgWord } from "#src/access-intent/bash/node-text";
 import {
   type CommandWord,
   classifyWrapperWords,
   executedUnitOf,
-  isTransparentWrapper,
+  floorExemptionOf,
+  inlineShellPayloadIndex,
 } from "#src/access-intent/bash/wrapper-analysis";
 
 /**
@@ -19,10 +21,26 @@ function words(unitText: string): CommandWord[] {
   const pattern = /"[^"]*"|'[^']*'|\S+/g;
   let match = pattern.exec(unitText);
   while (match !== null) {
-    out.push({ text: match[0], offset: match.index });
+    out.push({ ...argWordOf(match[0]), text: match[0], offset: match.index });
     match = pattern.exec(unitText);
   }
   return out;
+}
+
+/**
+ * The value a stand-in word reaches its program with: the surrounding quotes
+ * removed, and computed when an unquoted or double-quoted `$` decides it. A
+ * computed stand-in may always lead with a dash, the conservative reading.
+ */
+function argWordOf(text: string): ArgWord {
+  const quoted = /^(['"])(.*)\1$/s.exec(text);
+  const value = quoted ? quoted[2] : text;
+  const computed = quoted?.[1] !== "'" && value.includes("$");
+  return {
+    value,
+    computed,
+    mayLeadWithDash: computed || value.startsWith("-"),
+  };
 }
 
 describe("classifyWrapperWords", () => {
@@ -106,6 +124,89 @@ describe("classifyWrapperWords", () => {
 
     it("does not flag an empty word list", () => {
       expect(classifyWrapperWords([])).toBeUndefined();
+    });
+  });
+});
+
+describe("inlineShellPayloadIndex", () => {
+  /** The payload index of a unit spelled as plain whitespace-separated words. */
+  function payloadIndex(unitText: string): number {
+    return inlineShellPayloadIndex(words(unitText));
+  }
+
+  describe("a shell running an inline program", () => {
+    it.each([
+      ['bash -c "rm -rf /"', 2],
+      ["sh -c 'ls'", 2],
+      ["dash -c ls", 2],
+      ["zsh -c ls", 2],
+      ["ksh -c ls", 2],
+      ['bash -ec "make build"', 2],
+      ['bash -xc "make build"', 2],
+      ['/bin/bash -c "ls"', 2],
+      ['bash -i -c "ls"', 3],
+    ])("names the argument after the -c cluster in %s", (unit, expected) => {
+      expect(payloadIndex(unit)).toBe(expected);
+    });
+
+    it("names eval's first argument, which takes no flag", () => {
+      expect(payloadIndex('eval "rm x"')).toBe(1);
+    });
+  });
+
+  describe("a shell reached through an indirection wrapper", () => {
+    // `executedUnitOf` peels indirection to name the payload, so this must peel
+    // it too: otherwise `sudo bash -c 'TOKEN=…'` masks under `executedUnit` and
+    // not under `command`, which is the inconsistency #923 reports.
+    it.each([
+      [`sudo bash -c 'x'`, 3],
+      [`xargs sh -c 'x'`, 3],
+      [`timeout 5 bash -c 'x'`, 4],
+      [`env FOO=bar bash -c 'x'`, 4],
+      [`sudo -u root bash -c 'x'`, 5],
+      [`sudo timeout 5 bash -c 'x'`, 5],
+      [`find . -exec sh -c 'x' ;`, 5],
+    ])("names the payload of %s through the wrapper", (unit, expected) => {
+      expect(payloadIndex(unit)).toBe(expected);
+    });
+
+    it.each([
+      [`sudo ls`, "the wrapped command carries no inline program"],
+      [`xargs grep foo`, "the wrapped command carries no inline program"],
+      [`sudo python3 -c 'x'`, "the wrapped interpreter is not a shell"],
+      [`xargs --unknown-opt`, "the wrapper's own options run out first"],
+      [`find . -exec`, "the exec flag ends the command"],
+    ])("answers -1 for %s (%s)", (unit) => {
+      expect(payloadIndex(unit)).toBe(-1);
+    });
+  });
+
+  describe("a unit carrying no inline program", () => {
+    it.each([
+      ["bash script.sh", "a shell running a script file"],
+      ["bash --help", "a long option is not a -c cluster"],
+      ["bash -- -c", "the -c follows the end-of-options marker"],
+      ["python3 -c 'print(1)'", "an interpreter is not a shell"],
+      ["node -e 'x'", "an interpreter is not a shell"],
+      ["sudo ls", "an indirection wrapper hides no payload"],
+      ["ls -la", "an ordinary command"],
+    ])("answers -1 for %s (%s)", (unit) => {
+      expect(payloadIndex(unit)).toBe(-1);
+    });
+
+    it("answers -1 for an empty word list", () => {
+      expect(inlineShellPayloadIndex([])).toBe(-1);
+    });
+  });
+
+  describe("a payload flag with nothing after it", () => {
+    // The index still names where the payload *would* be; the caller decides
+    // what an out-of-range index is worth, exactly as `opaquePayload` does.
+    it.each([
+      ["bash -c", 2],
+      ["eval", 1],
+    ])("names the vacant position in %s", (unit, expected) => {
+      expect(payloadIndex(unit)).toBe(expected);
     });
   });
 });
@@ -203,10 +304,13 @@ describe("executedUnitOf", () => {
   });
 });
 
-describe("isTransparentWrapper", () => {
-  /** The predicate over a unit that carries no write-proving redirect. */
+describe("floorExemptionOf", () => {
+  /** Whether a unit with no write-proving redirect is exempt as a core reader. */
   function isTransparent(unitText: string): boolean {
-    return isTransparentWrapper(words(unitText), { writesViaRedirect: false });
+    return (
+      floorExemptionOf(words(unitText), { writesViaRedirect: false }) ===
+      "core-reader"
+    );
   }
 
   describe("a wrapper running a proven pure reader", () => {
@@ -286,19 +390,141 @@ describe("isTransparentWrapper", () => {
     });
 
     it("is not transparent for an empty word list", () => {
-      expect(isTransparentWrapper([], { writesViaRedirect: false })).toBe(
-        false,
-      );
+      expect(
+        floorExemptionOf([], { writesViaRedirect: false }),
+      ).toBeUndefined();
     });
   });
 
   describe("a write-proving redirect", () => {
     it("withholds the exemption from an otherwise transparent wrapper", () => {
       const unit = "xargs grep foo";
-      expect(isTransparent(unit)).toBe(true);
+      expect(floorExemptionOf(words(unit), { writesViaRedirect: false })).toBe(
+        "core-reader",
+      );
       expect(
-        isTransparentWrapper(words(unit), { writesViaRedirect: true }),
-      ).toBe(false);
+        floorExemptionOf(words(unit), { writesViaRedirect: true }),
+      ).toBeUndefined();
+    });
+  });
+
+  describe("an execution modifier", () => {
+    /** The exemption a unit earns, with or without a write-proving redirect. */
+    function exemptionOf(
+      unitText: string,
+      writesViaRedirect = false,
+    ): string | undefined {
+      return floorExemptionOf(words(unitText), { writesViaRedirect });
+    }
+
+    describe("running any visible command", () => {
+      it.each([
+        "time pnpm test",
+        "timeout 300 pnpm run lint",
+        "timeout -s KILL 10 pnpm test",
+        "timeout -sKILL -k5 10 pnpm test",
+        "timeout --signal=KILL 10 pnpm test",
+        "nice -n 5 pnpm test",
+        "nice --adjustment=5 pnpm test",
+        "stdbuf -oL pnpm test",
+        "stdbuf -o L pnpm test",
+        "setsid pnpm test",
+        "time timeout 5 pnpm test",
+        "time FOO=1 pnpm test",
+        "/usr/bin/time pnpm test",
+        "time ./scripts/x.sh",
+        "time -f %e pnpm test",
+        "time -- pnpm test",
+      ])("is exempt: %s", (unit) => {
+        expect(exemptionOf(unit)).toBe("execution-modifier");
+      });
+
+      it("stays exempt when the statement writes through a redirect", () => {
+        // The destination is gated by the path surfaces, as for the bare
+        // command; this clause inherits a verdict rather than proving a read.
+        expect(exemptionOf("time pnpm test", true)).toBe("execution-modifier");
+      });
+    });
+
+    describe("with a flag the modifier admits", () => {
+      it.each([
+        "time -p pnpm test",
+        "/usr/bin/time -l yarn make",
+        "/usr/bin/time -h pnpm test",
+        "timeout -v 5 pnpm test",
+        "timeout --verbose 5 pnpm test",
+        "timeout --foreground 5 pnpm test",
+        "timeout -f 5 pnpm test",
+        "timeout -p 5 pnpm test",
+        "timeout --preserve-status 5 pnpm test",
+      ])("is exempt: %s", (unit) => {
+        expect(exemptionOf(unit)).toBe("execution-modifier");
+      });
+
+      it.each([
+        ["setsid -f pnpm test", "setsid's flags are unverified here"],
+        ["time -pl pnpm test", "a flag cluster is not listed"],
+      ])("is not exempt: %s (%s)", (unit) => {
+        expect(exemptionOf(unit)).toBeUndefined();
+      });
+    });
+
+    describe("running a proven pure reader", () => {
+      it("records the core-reader reason first", () => {
+        expect(exemptionOf("time grep foo")).toBe("core-reader");
+      });
+
+      it("falls back to the modifier reason when a redirect writes", () => {
+        expect(exemptionOf("time grep foo", true)).toBe("execution-modifier");
+      });
+    });
+
+    describe("refused", () => {
+      it.each([
+        ["time sudo rm -rf x", "a peeled layer changes who runs it"],
+        ["sudo time pnpm test", "the outer layer changes who runs it"],
+        ["time env A=1 pnpm test", "a peeled layer changes the environment"],
+        ["time xargs pnpm test", "a peeled layer feeds hidden arguments"],
+        ["nohup pnpm test", "nohup may write nohup.out"],
+        ["flock /tmp/l pnpm test", "flock creates its lock file"],
+        ["watch pnpm test", "watch repeats the command"],
+        ["timeout 5 bash -c 'rm x'", "the payload is not re-parsed"],
+        ["time eval 'rm x'", "the payload is not re-parsed"],
+      ])("is not exempt: %s (%s)", (unit) => {
+        expect(exemptionOf(unit)).toBeUndefined();
+      });
+
+      it.each([
+        ["timeout --sig KILL 5 rm -rf /", "an abbreviation hides its value"],
+        ["nice --adj 5 rm -rf /", "an abbreviation hides its value"],
+        ["timeout --unknown 5 pnpm test", "an unlisted option"],
+        ["/usr/bin/time -o t.txt pnpm test", "-o writes a file"],
+        ["time --output=t.txt pnpm test", "--output writes a file"],
+        ["time -a -o t.txt pnpm test", "-a appends to a file"],
+        ["nice -5 pnpm test", "the legacy numeric form is not listed"],
+      ])("is not exempt: %s (%s)", (unit) => {
+        expect(exemptionOf(unit)).toBeUndefined();
+      });
+
+      it.each([
+        ["time { rm -rf /tmp/x; }", "a brace group is not a command"],
+        ["time (rm -rf /tmp/x)", "a subshell is not a command"],
+        ["time $(echo rm) -rf x", "a computed head is not a name"],
+        ['time "$CMD" x', "a computed head is not a name"],
+        ["time if true", "a reserved word is not a command"],
+        ["time -- -x", "a dash-led head is not a name"],
+      ])("is not exempt: %s (%s)", (unit) => {
+        expect(exemptionOf(unit)).toBeUndefined();
+      });
+
+      it.each([
+        ["time sudo --unknown-opt", "the peel stopped at a wrapper"],
+        ["time time time time time pnpm test", "the peel ran out of depth"],
+        ["time", "there is no inner command"],
+        ["timeout 5", "there is no inner command"],
+      ])("is not exempt: %s (%s)", (unit) => {
+        expect(exemptionOf(unit)).toBeUndefined();
+      });
     });
   });
 });

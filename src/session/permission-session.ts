@@ -5,6 +5,7 @@ import type { ShellToolsConfig } from "#src/config/config-schema";
 import type { SessionConfigStore } from "#src/config/config-store";
 import type { PermissionSystemExtensionConfig } from "#src/config/extension-config";
 import type { ExtensionPaths } from "#src/config/extension-paths";
+import { syncPermissionSystemStatus } from "#src/config/status";
 import type { SkillPromptEntry } from "#src/exposure/skill-prompt-sanitizer";
 import {
   ToolSurfaceBaseline,
@@ -14,6 +15,7 @@ import {
 import type { ToolCallGateInputs } from "#src/handlers/gates/tool-call-gate-pipeline";
 import type { PathFlavor } from "#src/path/path-flavor";
 import { PathNormalizer } from "#src/path/path-normalizer";
+import type { InfrastructureReadScope } from "#src/path/pi-infrastructure-read";
 import type { ScopedPermissionManager } from "#src/policy/permission-manager";
 import {
   resolveToolPreviewLimits,
@@ -202,15 +204,25 @@ export class PermissionSession implements ToolCallGateInputs {
   // ── Config ─────────────────────────────────────────────────────────────
 
   /**
-   * Reload merged config from disk; optionally update the stored runtime
-   * context. When `projectTrusted` is `false`, the project scope is withheld
-   * so an untrusted project's runtime config is not merged (#644).
+   * Reload merged config from disk, then bring the status bar in step with it.
+   *
+   * When `projectTrusted` is `false`, the project scope is withheld so an
+   * untrusted project's runtime config is not merged (#644).
+   *
+   * The status sync lives here rather than in `ConfigStore` because it is a UI
+   * side effect of the session, keyed on the session's context: the store
+   * loads and answers, and needs no ctx to do it (#933). Both drivers
+   * (`session_start` and every `before_agent_start`) call this one method, so
+   * the sync has a single home rather than one copy per handler.
    */
   refreshConfig(
     ctx: ExtensionContext | undefined,
     projectTrusted: boolean,
   ): void {
-    this.configStore.refresh(ctx, projectTrusted);
+    this.configStore.refresh(ctx?.cwd, projectTrusted);
+    if (ctx?.hasUI) {
+      syncPermissionSystemStatus(ctx, this.configStore.current());
+    }
   }
 
   /** Write the resolved config path set to the review and debug logs. */
@@ -226,14 +238,17 @@ export class PermissionSession implements ToolCallGateInputs {
   // ── Infrastructure paths ───────────────────────────────────────────────
 
   /**
-   * Combined infrastructure read directories: static paths from
-   * `ExtensionPaths` plus config-derived paths.
+   * Where infrastructure reads are auto-allowed: the static roots from
+   * `ExtensionPaths` plus the config-derived `piInfrastructureReadPaths`.
    */
-  getInfrastructureReadDirs(): string[] {
-    return [
-      ...this.paths.piInfrastructureDirs,
-      ...(this.config.piInfrastructureReadPaths ?? []),
-    ];
+  getInfrastructureReadScope(): InfrastructureReadScope {
+    return {
+      dirs: [
+        ...this.paths.piInfrastructureDirs,
+        ...(this.config.piInfrastructureReadPaths ?? []),
+      ],
+      excludedDirs: this.paths.piInfrastructureExcludedDirs,
+    };
   }
 
   /**

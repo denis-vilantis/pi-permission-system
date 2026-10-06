@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
+import { AskDialogQueue } from "#src/authority/ask-dialog-queue";
 import { LocalUserAuthorizer } from "#src/authority/local-user-authorizer";
 import type { PermissionPromptDecision } from "#src/authority/permission-dialog";
 import type { requestPermissionDecision } from "#src/authority/permission-prompt-component";
 import type { PromptPermissionDetails } from "#src/authority/permission-prompter";
+import type { NotificationSession } from "#src/presentation/prompt-notification";
 import { DECIDED_BY_HUMAN } from "#test/helpers/decision-fixtures";
 import {
   makePromptDetails,
@@ -38,15 +40,45 @@ function makePromptUi() {
   };
 }
 
+/**
+ * A `PermissionEventBus` double. `onEmit` observes the emission without
+ * replacing it, so a test that cares about emit-versus-present ordering can
+ * still build its deps through {@link makeDeps}.
+ */
+function makeEvents(onEmit?: () => void) {
+  return {
+    emit: vi.fn(() => {
+      onEmit?.();
+    }),
+    on: vi.fn().mockReturnValue(() => undefined),
+  };
+}
+
+/** Drain every pending microtask, so a queued presentation has had its turn. */
+function settleMicrotasks(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
+const APPROVED: PermissionPromptDecision = {
+  approved: true,
+  state: "approved",
+  decidedBy: DECIDED_BY_HUMAN,
+};
+
 function makeDeps(
   overrides: {
+    events?: ReturnType<typeof makeEvents>;
+    dialogs?: AskDialogQueue;
     requestPermissionDecision?: typeof requestPermissionDecision;
   } = {},
 ) {
-  const events = {
-    emit: vi.fn(),
-    on: vi.fn().mockReturnValue(() => undefined),
-  };
+  const describeSession = vi.fn(
+    (): NotificationSession => ({ name: "refactor-auth", cwd: "/w/repo" }),
+  );
+  const events = overrides.events ?? makeEvents();
+  const dialogs = overrides.dialogs ?? new AskDialogQueue();
   const ui = makePromptUi();
   const decisionFn =
     overrides.requestPermissionDecision ??
@@ -60,10 +92,14 @@ function makeDeps(
       ui,
       mode: "tui" as const,
       events,
+      dialogs,
       getPromptPreferences: () => makePromptPreferences(),
       requestPermissionDecision: decisionFn,
+      describeSession,
     },
+    describeSession,
     events,
+    dialogs,
     ui,
     decisionFn,
   };
@@ -126,11 +162,45 @@ describe("LocalUserAuthorizer", () => {
     await authorizer.authorize(details);
 
     expect(decisionFn).toHaveBeenCalledWith(
-      { mode: "tui", ui, ...makePromptPreferences() },
+      {
+        mode: "tui",
+        ui,
+        ...makePromptPreferences(),
+        notice: {
+          title: "pi \u2014 refactor-auth",
+          body: "Permission Required: read",
+        },
+      },
       "Permission Required",
       details.payload,
       undefined,
     );
+  });
+
+  describe("notification notice", () => {
+    it("reads the session when each prompt opens, not when the authorizer is built", async () => {
+      const { deps, describeSession, decisionFn, ui } = makeDeps();
+      const authorizer = new LocalUserAuthorizer(deps);
+
+      await authorizer.authorize(makeDetails());
+      describeSession.mockReturnValue({ name: "renamed", cwd: "/w/repo" });
+      await authorizer.authorize(makeDetails());
+
+      expect(decisionFn).toHaveBeenLastCalledWith(
+        {
+          mode: "tui",
+          ui,
+          ...makePromptPreferences(),
+          notice: {
+            title: "pi \u2014 renamed",
+            body: "Permission Required: read",
+          },
+        },
+        "Permission Required",
+        expect.anything(),
+        undefined,
+      );
+    });
   });
 
   it("passes the sessionLabel option when present", async () => {
@@ -149,15 +219,88 @@ describe("LocalUserAuthorizer", () => {
     );
   });
 
+  describe("session label for a path ask that proves no direction", () => {
+    it("names a bare external_directory directory approval by its contents glob", async () => {
+      const { deps, decisionFn } = makeDeps();
+      const authorizer = new LocalUserAuthorizer(deps);
+
+      await authorizer.authorize(
+        makeDetails({
+          sessionApproval: {
+            grants: [
+              { surface: "external_directory", pattern: "/r/a" },
+              { surface: "external_directory", pattern: "/r/a/*" },
+            ],
+          },
+        }),
+      );
+
+      expect(decisionFn).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.any(String),
+        expect.anything(),
+        { sessionLabel: 'Yes, allow access to "/r/a/*" for this session' },
+      );
+    });
+
+    it("names a bare path approval by its pattern", async () => {
+      const { deps, decisionFn } = makeDeps();
+      const authorizer = new LocalUserAuthorizer(deps);
+
+      await authorizer.authorize(
+        makeDetails({
+          sessionApproval: { grants: [{ surface: "path", pattern: "/r/*" }] },
+        }),
+      );
+
+      expect(decisionFn).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.any(String),
+        expect.anything(),
+        { sessionLabel: 'Yes, allow access to "/r/*" for this session' },
+      );
+    });
+
+    it("keeps a gate-supplied label over the fallback", async () => {
+      const { deps, decisionFn } = makeDeps();
+      const authorizer = new LocalUserAuthorizer(deps);
+
+      await authorizer.authorize(
+        makeDetails({
+          sessionLabel: 'Yes, allow edit "/r/*" for this session',
+          sessionApproval: { grants: [{ surface: "path", pattern: "/r/*" }] },
+        }),
+      );
+
+      expect(decisionFn).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.any(String),
+        expect.anything(),
+        { sessionLabel: 'Yes, allow edit "/r/*" for this session' },
+      );
+    });
+
+    it("adds no label for a grant on a non-path surface", async () => {
+      const { deps, decisionFn } = makeDeps();
+      const authorizer = new LocalUserAuthorizer(deps);
+
+      await authorizer.authorize(
+        makeDetails({
+          sessionApproval: { grants: [{ surface: "bash", pattern: "git *" }] },
+        }),
+      );
+
+      expect(decisionFn).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.any(String),
+        expect.anything(),
+        undefined,
+      );
+    });
+  });
+
   it("emits the UI event before calling requestPermissionDecision", async () => {
     const calls: string[] = [];
-    const events = {
-      emit: vi.fn(() => {
-        calls.push("emit");
-      }),
-      on: vi.fn().mockReturnValue(() => undefined),
-    };
-    const ui = makePromptUi();
     const decisionFn = vi.fn<typeof requestPermissionDecision>(() => {
       calls.push("dialog");
       return Promise.resolve({
@@ -166,13 +309,13 @@ describe("LocalUserAuthorizer", () => {
         decidedBy: DECIDED_BY_HUMAN,
       });
     });
-    const authorizer = new LocalUserAuthorizer({
-      ui,
-      mode: "tui",
-      events,
-      getPromptPreferences: () => makePromptPreferences(),
+    const { deps } = makeDeps({
+      events: makeEvents(() => {
+        calls.push("emit");
+      }),
       requestPermissionDecision: decisionFn,
     });
+    const authorizer = new LocalUserAuthorizer(deps);
 
     await authorizer.authorize(makeDetails());
 
@@ -223,8 +366,17 @@ describe("LocalUserAuthorizer", () => {
 
       await authorizer.authorize(details);
 
+      // The notice carries the same forwarded title the dialog does.
       expect(decisionFn).toHaveBeenCalledWith(
-        { mode: "tui", ui, ...makePromptPreferences() },
+        {
+          mode: "tui",
+          ui,
+          ...makePromptPreferences(),
+          notice: {
+            title: "pi \u2014 refactor-auth",
+            body: "Permission Required (Subagent): read",
+          },
+        },
         "Permission Required (Subagent)",
         details.payload,
         undefined,
@@ -368,7 +520,7 @@ describe("LocalUserAuthorizer", () => {
           { surface: "external_directory_read", pattern: "/outside/a/*" },
           { surface: "external_directory_write", pattern: "/outside/b/*" },
         ],
-        undefined,
+        { sessionLabel: "Yes, allow access to 2 paths for this session" },
       );
     });
 
@@ -407,5 +559,81 @@ describe("LocalUserAuthorizer", () => {
     const result = await authorizer.authorize(makeDetails());
 
     expect(result).toEqual(decision);
+  });
+
+  describe("one dialog at a time", () => {
+    /**
+     * A pair of asks whose first dialog stays open until the test answers it,
+     * so "the second one has not been shown yet" is observable.
+     */
+    function makeOverlappingAsks() {
+      const open = Promise.withResolvers<PermissionPromptDecision>();
+      const decisionFn = vi
+        .fn<typeof requestPermissionDecision>()
+        .mockReturnValueOnce(open.promise)
+        .mockResolvedValue(APPROVED);
+      const { deps, events, dialogs } = makeDeps({
+        requestPermissionDecision: decisionFn,
+      });
+      const authorizer = new LocalUserAuthorizer(deps);
+      return {
+        decisionFn,
+        events,
+        dialogs,
+        answerFirst: () => {
+          open.resolve(APPROVED);
+        },
+        first: authorizer.authorize(makeDetails()),
+        second: authorizer.authorize(makeDetails()),
+      };
+    }
+
+    it("does not present a second ask while the first dialog is open", async () => {
+      const asks = makeOverlappingAsks();
+      await settleMicrotasks();
+
+      expect(asks.decisionFn).toHaveBeenCalledTimes(1);
+
+      asks.answerFirst();
+      await expect(asks.first).resolves.toEqual(APPROVED);
+      await expect(asks.second).resolves.toEqual(APPROVED);
+      expect(asks.decisionFn).toHaveBeenCalledTimes(2);
+    });
+
+    it("announces the second ask only when its dialog is presented", async () => {
+      const asks = makeOverlappingAsks();
+      await settleMicrotasks();
+
+      expect(asks.events.emit).toHaveBeenCalledTimes(1);
+
+      asks.answerFirst();
+      await asks.first;
+      await settleMicrotasks();
+
+      expect(asks.events.emit).toHaveBeenCalledTimes(2);
+      await asks.second;
+    });
+
+    it("answers a released ask as an unanswered denial", async () => {
+      const asks = makeOverlappingAsks();
+      await settleMicrotasks();
+
+      asks.dialogs.releaseAll("the session ended");
+
+      await expect(asks.first).resolves.toEqual({
+        approved: false,
+        state: "denied",
+        confirmationUnavailable: true,
+        denialReason: "the session ended",
+        decidedBy: { kind: "unavailable", reason: "the session ended" },
+      });
+      await expect(asks.second).resolves.toEqual({
+        approved: false,
+        state: "denied",
+        confirmationUnavailable: true,
+        denialReason: "the session ended",
+        decidedBy: { kind: "unavailable", reason: "the session ended" },
+      });
+    });
   });
 });
