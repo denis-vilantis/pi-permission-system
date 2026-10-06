@@ -226,6 +226,30 @@ describe("PermissionSession", () => {
         "c:\\projects\\app\\src\\foo.ts",
       );
     });
+
+    it("reads sessionApprovalScope from the current config at call time", () => {
+      let scope: "parent-dir" | "repo-root" | number = "parent-dir";
+      const { session } = createSession({
+        configStore: makeConfigStore({
+          current: () => ({
+            ...DEFAULT_EXTENSION_CONFIG_VALUE,
+            sessionApprovalScope: scope,
+          }),
+        }),
+      });
+      session.activate(makeCtx({ cwd: "/projects/app" }));
+      const normalizer = session.getPathNormalizer();
+      const accessPath = normalizer.forPath("src/foo.ts");
+
+      expect(normalizer.approvalPatternsFor(accessPath)).toEqual([
+        "/projects/app/src/*",
+      ]);
+
+      scope = 2;
+      expect(normalizer.approvalPatternsFor(accessPath)).toEqual([
+        "/projects/*",
+      ]);
+    });
   });
 
   describe("shutdown", () => {

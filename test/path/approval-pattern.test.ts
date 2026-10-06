@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { deriveApprovalPatterns } from "#src/path/approval-pattern";
+import {
+  contentsScopePattern,
+  deriveApprovalPatterns,
+  riseToAncestor,
+} from "#src/path/approval-pattern";
 import type { PathFlavor } from "#src/path/path-flavor";
 import { posixPathFlavor, win32PathFlavor } from "#src/path/path-flavor";
 import { evaluate } from "#src/policy/rule";
@@ -215,6 +219,38 @@ describe("deriveApprovalPatterns", () => {
           win32PathFlavor,
         ).action,
       ).toBe("ask");
+    });
+  });
+
+  describe("contentsScopePattern", () => {
+    it.each([
+      ["/a/b", "/a/b/*"],
+      ["/a/b/", "/a/b/*"],
+      ["/", "/*"],
+      ["C:\\a", "C:\\a\\*"],
+      ["C:\\", "C:\\*"],
+    ])("covers everything beneath %s", (value, expected) => {
+      const flavor = value.startsWith("C:")
+        ? win32PathFlavor
+        : posixPathFlavor;
+      expect(contentsScopePattern(value, flavor)).toBe(expected);
+    });
+  });
+
+  describe("riseToAncestor", () => {
+    it.each([
+      ["/a/b/c.ts", 0, "/a/b/c.ts"],
+      ["/a/b/c.ts", 1, "/a/b"],
+      ["/a/b/c.ts", 2, "/a"],
+      ["/a/b/c.ts", 99, "/"],
+      ["/", 3, "/"],
+    ])("rises %s by %i levels", (value, levels, expected) => {
+      expect(riseToAncestor(value, levels, posixPathFlavor)).toBe(expected);
+    });
+
+    it("rises a native win32 path under win32 separators", () => {
+      expect(riseToAncestor("C:\\a\\b", 1, win32PathFlavor)).toBe("C:\\a");
+      expect(riseToAncestor("C:\\a\\b", 9, win32PathFlavor)).toBe("C:\\");
     });
   });
 });

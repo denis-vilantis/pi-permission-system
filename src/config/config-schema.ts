@@ -403,6 +403,20 @@ export const unifiedConfigSchema = z
         "Require a confirming second press of a decision hotkey (`y`/`s`/`n`/`r`) in the inline permission dialog before it commits — the first press arms the action and shows a `Press y again to approve.` hint.\n\nApplies to interactive **TUI** sessions only; the non-TUI (RPC/frontend) prompt keeps its single-select flow. Set to `false` to commit decisions on the first hotkey press.",
       default: true,
     }),
+    sessionApprovalScope: z
+      .union([
+        z.literal("parent-dir"),
+        z.literal("repo-root"),
+        z.number().int().min(0),
+      ])
+      .optional()
+      .meta({
+        description:
+          'Scope of the wildcard a "for this session" path grant is recorded at: "parent-dir" (default), "repo-root", or a number of levels above the accessed directory.',
+        markdownDescription:
+          'Scope of the wildcard a **"for this session"** path grant is recorded at.\n\n- `"parent-dir"` (default) — the accessed directory, or the file\'s parent directory. Today\'s behavior.\n- `"repo-root"` — the nearest ancestor holding a `.git` entry (the repository root). Falls back to `"parent-dir"` when the path has no repository ancestor, so the approved path stays covered.\n- A number — rise that many directories above the accessed directory (a file ask uses its parent), clamped at the filesystem root; `0` is `"parent-dir"`.\n\nWidening changes only the pattern the dialog offers; the human still approves each session grant explicitly.',
+        default: "parent-dir",
+      }),
     permissionDialogKeys: dialogKeysSchema.optional(),
     promptNotifications: z
       .array(promptNotificationChannelSchema)
@@ -503,6 +517,9 @@ export type UnifiedPermissionConfig = z.infer<typeof unifiedConfigSchema>;
 export type PromptNotificationChannel = z.infer<
   typeof promptNotificationChannelSchema
 >;
+
+/** The scope a "for this session" path grant is recorded at. */
+export type SessionApprovalScope = "parent-dir" | "repo-root" | number;
 
 /**
  * Derive the published JSON Schema (Draft 2020-12) from the zod source.

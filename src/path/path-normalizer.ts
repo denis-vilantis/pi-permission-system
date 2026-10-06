@@ -6,7 +6,13 @@ import {
   normalizePathPolicyLiteral,
 } from "#src/access-intent/path-normalization";
 import { classifyToolKind } from "#src/access-intent/tool-kind";
-import { deriveApprovalPatterns } from "./approval-pattern";
+import type { SessionApprovalScope } from "#src/config/config-schema";
+import {
+  contentsScopePattern,
+  deriveApprovalPatterns,
+  riseToAncestor,
+} from "./approval-pattern";
+import { findGitRoot } from "./git-root";
 import { resolveNativeToolTarget } from "./native-tool-target";
 import { isPathOutsideWorkingDirectory } from "./path-containment";
 import type { PathFlavor } from "./path-flavor";
@@ -52,6 +58,8 @@ export class PathNormalizer {
   constructor(
     readonly flavor: PathFlavor,
     private readonly cwd: string,
+    private readonly approvalScope: () => SessionApprovalScope = () =>
+      "parent-dir",
   ) {
     this.canonicalCwd = canonicalNormalizePathForComparison(cwd, cwd, flavor);
   }
@@ -140,13 +148,38 @@ export class PathNormalizer {
    * same representation the decision displayed (#438). Deriving it here rather
    * than at each gate keeps the platform's separator alphabet with the object
    * that owns the flavor, instead of an ambient `node:path` read (#655).
+   *
+   * The configured `sessionApprovalScope` widens the anchor: `repo-root`
+   * walks to the nearest `.git` ancestor, a number rises that many
+   * directories, and either falls back to the parent scope when the path has
+   * no repository or no room to rise, so the approved path is always covered.
    */
   approvalPatternsFor(accessPath: AccessPath): readonly string[] {
-    return deriveApprovalPatterns(
-      accessPath.value(),
-      this.flavor,
-      this.namesDirectory(accessPath),
-    );
+    const value = accessPath.value();
+    const isDirectory = this.namesDirectory(accessPath);
+    const parentScope = () =>
+      deriveApprovalPatterns(value, this.flavor, isDirectory);
+    const scope = this.approvalScope();
+    if (scope === "parent-dir") return parentScope();
+    // A literal-only path has no resolvable base: probing or walking it would
+    // read the process cwd or a fabricated drive, so it keeps the parent scope
+    // (#989's no-probe rule).
+    if (!accessPath.boundaryValue()) return parentScope();
+    const grantRoot = isDirectory ? value : this.flavor.impl.dirname(value);
+    if (scope === "repo-root") {
+      const gitRoot = findGitRoot(grantRoot, this.flavor);
+      if (gitRoot === undefined) return parentScope();
+      if (isDirectory && gitRoot === value) {
+        return deriveApprovalPatterns(value, this.flavor, true);
+      }
+      return [contentsScopePattern(gitRoot, this.flavor)];
+    }
+    if (!Number.isInteger(scope) || scope <= 0) return parentScope();
+    const anchor = riseToAncestor(grantRoot, scope, this.flavor);
+    if (isDirectory && anchor === value) {
+      return deriveApprovalPatterns(value, this.flavor, true);
+    }
+    return [contentsScopePattern(anchor, this.flavor)];
   }
 
   /**

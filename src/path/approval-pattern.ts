@@ -29,7 +29,7 @@ export function deriveApprovalPatterns(
   isDirectory: boolean,
 ): readonly string[] {
   if (!isDirectory) return [parentScopePattern(pathValue, flavor)];
-  return [pathValue, directoryContentsPattern(pathValue, flavor)];
+  return [pathValue, contentsScopePattern(pathValue, flavor)];
 }
 
 /** The value's enclosing directory scope (up to its last separator) plus `*`. */
@@ -40,7 +40,7 @@ function parentScopePattern(pathValue: string, flavor: PathFlavor): string {
 }
 
 /** Everything beneath a directory value: the value, a separator, then `*`. */
-function directoryContentsPattern(
+export function contentsScopePattern(
   pathValue: string,
   flavor: PathFlavor,
 ): string {
@@ -49,4 +49,26 @@ function directoryContentsPattern(
   const separator =
     lastSeparator < 0 ? flavor.impl.sep : pathValue[lastSeparator];
   return `${pathValue}${separator}*`;
+}
+
+/**
+ * Rise `levels` directories above `pathValue`, clamped at the filesystem root.
+ *
+ * Uses the flavor's `dirname`, so a native win32 path and a POSIX path each
+ * rise under their own separator alphabet. A value already at a root returns
+ * itself, which lets a caller clamp an over-deep numeric scope rather than
+ * error.
+ */
+export function riseToAncestor(
+  pathValue: string,
+  levels: number,
+  flavor: PathFlavor,
+): string {
+  let dir = pathValue;
+  for (let i = 0; i < levels; i += 1) {
+    const parent = flavor.impl.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return dir;
 }

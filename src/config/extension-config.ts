@@ -9,7 +9,7 @@ import type {
   ShellToolsConfig,
   UnifiedPermissionConfig,
 } from "./config-loader";
-import type { PromptNotificationChannel } from "./config-schema";
+import type { PromptNotificationChannel, SessionApprovalScope } from "./config-schema";
 import type { DialogKeyOverrides } from "./dialog-keys";
 
 export const EXTENSION_ID = "pi-permission-system";
@@ -20,6 +20,8 @@ export interface PermissionSystemExtensionConfig {
   yoloMode: boolean;
   /** Require a confirming second press of a decision hotkey in the inline TUI dialog. Defaults to true. */
   doublePressToConfirm: boolean;
+  /** Scope of the wildcard a "for this session" path grant is recorded at. Defaults to "parent-dir". */
+  sessionApprovalScope: SessionApprovalScope;
   /** Additional directories to auto-allow for reads as Pi infrastructure. */
   piInfrastructureReadPaths?: string[];
   /** How long a subagent waits for the parent's answer to a forwarded ask, in ms. Defaults to 600000. */
@@ -45,6 +47,7 @@ export const DEFAULT_EXTENSION_CONFIG: PermissionSystemExtensionConfig = {
   permissionReviewLog: true,
   yoloMode: false,
   doublePressToConfirm: true,
+  sessionApprovalScope: "parent-dir",
 };
 
 function resolveExtensionRoot(moduleUrl = import.meta.url): string {
@@ -77,6 +80,7 @@ export function normalizePermissionSystemConfig(
     permissionReviewLog: raw.permissionReviewLog !== false,
     yoloMode: raw.yoloMode === true,
     doublePressToConfirm: raw.doublePressToConfirm !== false,
+    sessionApprovalScope: raw.sessionApprovalScope ?? "parent-dir",
   };
   if (raw.piInfrastructureReadPaths !== undefined) {
     result.piInfrastructureReadPaths = raw.piInfrastructureReadPaths;

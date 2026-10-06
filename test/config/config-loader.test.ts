@@ -523,6 +523,21 @@ describe("mergeUnifiedConfigs", () => {
     expect(merged.doublePressToConfirm).toBe(false);
   });
 
+  it("replaces sessionApprovalScope (project wins)", () => {
+    expect(
+      mergeUnifiedConfigs(
+        { sessionApprovalScope: "parent-dir" },
+        { sessionApprovalScope: "repo-root" },
+      ).sessionApprovalScope,
+    ).toBe("repo-root");
+  });
+
+  it("carries sessionApprovalScope from the base when unoverridden", () => {
+    expect(
+      mergeUnifiedConfigs({ sessionApprovalScope: 2 }, {}).sessionApprovalScope,
+    ).toBe(2);
+  });
+
   it("replaces the prompt-budget scalars (project wins)", () => {
     const merged = mergeUnifiedConfigs(
       { promptMaxRows: 24, promptFieldMaxWidth: 400 },

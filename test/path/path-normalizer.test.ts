@@ -507,6 +507,97 @@ describe("PathNormalizer", () => {
     });
   });
 
+  describe("approvalPatternsFor with a configured scope", () => {
+    const tmp = createTmpFixture();
+
+    afterEach(() => {
+      tmp.cleanup();
+    });
+
+    test("a numeric scope rises that many directories", () => {
+      const root = tmp.dir("pi-perm-scope-");
+      const normalizer = new PathNormalizer(posixPathFlavor, root, () => 2);
+
+      expect(
+        normalizer.approvalPatternsFor(normalizer.forPath("a/b/c/file.ts")),
+      ).toEqual([`${root}/a/*`]);
+    });
+
+    test("a numeric scope clamps at the filesystem root", () => {
+      const normalizer = new PathNormalizer(posixPathFlavor, "/", () => 9);
+
+      expect(
+        normalizer.approvalPatternsFor(normalizer.forPath("/x/file.ts")),
+      ).toEqual(["/*"]);
+    });
+
+    test("scope 0 is the parent scope", () => {
+      const root = tmp.dir("pi-perm-scope-");
+      const normalizer = new PathNormalizer(posixPathFlavor, root, () => 0);
+
+      expect(
+        normalizer.approvalPatternsFor(normalizer.forPath("a/file.ts")),
+      ).toEqual([`${root}/a/*`]);
+    });
+
+    test("repo-root anchors at the nearest .git ancestor", () => {
+      const root = tmp.dir("pi-perm-scope-");
+      const repo = tmp.subdir(root, "repo");
+      tmp.subdir(repo, ".git");
+      const normalizer = new PathNormalizer(
+        posixPathFlavor,
+        root,
+        () => "repo-root",
+      );
+      const file = tmp.file(tmp.subdir(repo, "pkg"), "x.ts");
+
+      expect(normalizer.approvalPatternsFor(normalizer.forPath(file))).toEqual([
+        `${repo}/*`,
+      ]);
+    });
+
+    test("repo-root on the repository directory keeps the directory form", () => {
+      const root = tmp.dir("pi-perm-scope-");
+      const repo = tmp.subdir(root, "repo");
+      tmp.subdir(repo, ".git");
+      const normalizer = new PathNormalizer(
+        posixPathFlavor,
+        root,
+        () => "repo-root",
+      );
+
+      expect(
+        normalizer.approvalPatternsFor(normalizer.forPath(repo)),
+      ).toEqual([repo, `${repo}/*`]);
+    });
+
+    test("repo-root falls back to the parent scope without a repository", () => {
+      const root = tmp.dir("pi-perm-scope-");
+      const normalizer = new PathNormalizer(
+        posixPathFlavor,
+        root,
+        () => "repo-root",
+      );
+      const file = tmp.file(tmp.subdir(root, "plain"), "x.ts");
+
+      expect(normalizer.approvalPatternsFor(normalizer.forPath(file))).toEqual([
+        `${root}/plain/*`,
+      ]);
+    });
+
+    test("a literal-only path keeps the parent scope", () => {
+      const normalizer = new PathNormalizer(
+        posixPathFlavor,
+        "/projects/my-app",
+        () => "repo-root",
+      );
+
+      expect(
+        normalizer.approvalPatternsFor(normalizer.forLiteral("/outside/x.ts")),
+      ).toEqual(["/outside/*"]);
+    });
+  });
+
   describe("forToolPath", () => {
     // Real filesystem: `read`'s variant spellings are tried by existence.
     const tmp = createTmpFixture();

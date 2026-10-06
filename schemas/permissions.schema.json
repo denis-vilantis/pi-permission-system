@@ -31,6 +31,26 @@
       "default": true,
       "type": "boolean"
     },
+    "sessionApprovalScope": {
+      "description": "Scope of the wildcard a \"for this session\" path grant is recorded at: \"parent-dir\" (default), \"repo-root\", or a number of levels above the accessed directory.",
+      "markdownDescription": "Scope of the wildcard a **\"for this session\"** path grant is recorded at.\n\n- `\"parent-dir\"` (default) — the accessed directory, or the file's parent directory. Today's behavior.\n- `\"repo-root\"` — the nearest ancestor holding a `.git` entry (the repository root). Falls back to `\"parent-dir\"` when the path has no repository ancestor, so the approved path stays covered.\n- A number — rise that many directories above the accessed directory (a file ask uses its parent), clamped at the filesystem root; `0` is `\"parent-dir\"`.\n\nWidening changes only the pattern the dialog offers; the human still approves each session grant explicitly.",
+      "default": "parent-dir",
+      "anyOf": [
+        {
+          "type": "string",
+          "const": "parent-dir"
+        },
+        {
+          "type": "string",
+          "const": "repo-root"
+        },
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      ]
+    },
     "permissionDialogKeys": {
       "type": "object",
       "properties": {

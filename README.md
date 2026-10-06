@@ -15,6 +15,9 @@
 > - `commandItemArgument`: when `commandArgument` resolves to an array of command
 >   records (for example `ctx_batch_execute`'s `commands: [{ command }]`), the items are
 >   joined with newlines and gated as one multi-line shell program.
+> - `sessionApprovalScope`: widen the pattern a "for this session" path grant
+>   records — `"parent-dir"` (default), `"repo-root"` (the nearest `.git` ancestor),
+>   or a number of directories to rise above the accessed directory.
 >
 > Everything else is upstream at v40.0.0. Sync by cherry-picking upstream package commits.
 

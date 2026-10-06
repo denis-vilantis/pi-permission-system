@@ -12,6 +12,7 @@ import {
   getProjectConfigPath,
 } from "./config-paths";
 import {
+  type SessionApprovalScope,
   type ShellToolsConfig,
   type UnifiedPermissionConfig,
   unifiedConfigSchema,
@@ -22,7 +23,11 @@ import { type DialogKeysConfig, resolveDialogKeys } from "./dialog-keys";
 // the single source of truth) and re-exported so existing importers keep their
 // import path. All fields are optional so partial configs merge before
 // defaults are applied downstream.
-export type { ShellToolsConfig, UnifiedPermissionConfig };
+export type {
+  SessionApprovalScope,
+  ShellToolsConfig,
+  UnifiedPermissionConfig,
+};
 
 export interface UnifiedConfigLoadResult {
   config: UnifiedPermissionConfig;
@@ -231,6 +236,14 @@ export function mergeUnifiedConfigs(
     "toolInputPreviewMaxLength",
     "toolTextSummaryMaxLength",
   ] as const) {
+    const value = override[key] ?? base[key];
+    if (value !== undefined) {
+      merged[key] = value;
+    }
+  }
+
+  // Union scalars (string | number): override replaces base when defined
+  for (const key of ["sessionApprovalScope"] as const) {
     const value = override[key] ?? base[key];
     if (value !== undefined) {
       merged[key] = value;

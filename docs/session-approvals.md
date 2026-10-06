@@ -68,6 +68,16 @@ A path that does not exist yet, or a bash token whose base directory is unknown,
 
 When a path ask proves no read/write direction (an extension tool, or `edit`), the session option names its scope as `Yes, allow access to "<pattern>" for this session`.
 
+## Grant Scope
+
+The pattern recorded by **Yes, allow "<pattern>" for this session** is anchored at the accessed path's own directory by default; `sessionApprovalScope` widens that anchor:
+
+- `"parent-dir"` (default) — the accessed directory, or a file's parent directory.
+- `"repo-root"` — the nearest ancestor holding a `.git` entry, so one grant covers a repository's working tree. A path with no repository ancestor falls back to `"parent-dir"`, so the approved path stays covered.
+- A number — rise that many directories above the accessed directory (a file ask uses its parent), clamped at the filesystem root. `0` is `"parent-dir"`.
+
+Widening changes only the pattern the dialog offers; the human still approves each session grant explicitly.
+
 ## Bash Arity Table
 
 Bash pattern suggestions use a curated arity dictionary (`src/access-intent/bash/bash-arity.ts`) to determine how many tokens define the "human-understandable subcommand."

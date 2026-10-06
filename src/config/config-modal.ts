@@ -51,6 +51,7 @@ function cloneDefaultConfig(): PermissionSystemExtensionConfig {
     permissionReviewLog: DEFAULT_EXTENSION_CONFIG.permissionReviewLog,
     yoloMode: DEFAULT_EXTENSION_CONFIG.yoloMode,
     doublePressToConfirm: DEFAULT_EXTENSION_CONFIG.doublePressToConfirm,
+    sessionApprovalScope: DEFAULT_EXTENSION_CONFIG.sessionApprovalScope,
   };
 }
 

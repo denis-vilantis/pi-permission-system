@@ -60,7 +60,9 @@ export class PermissionSession implements ToolCallGateInputs {
     // Placeholder until the first activate(ctx) binds the real cwd; every gate
     // evaluate runs after activate (handleToolCall activates first), so this
     // empty-cwd value is never read.
-    this.pathNormalizer = new PathNormalizer(flavor, "");
+    this.pathNormalizer = new PathNormalizer(flavor, "", () =>
+      this.config.sessionApprovalScope,
+    );
   }
 
   // ── Context lifecycle ──────────────────────────────────────────────────
@@ -76,7 +78,9 @@ export class PermissionSession implements ToolCallGateInputs {
    */
   activate(ctx: ExtensionContext): void {
     this.context = ctx;
-    this.pathNormalizer = new PathNormalizer(this.flavor, ctx.cwd);
+    this.pathNormalizer = new PathNormalizer(this.flavor, ctx.cwd, () =>
+      this.config.sessionApprovalScope,
+    );
     this.forwarding.start(ctx);
     this.authorizerSelection.activate(ctx);
   }

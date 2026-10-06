@@ -98,6 +98,7 @@ describe("normalizePermissionSystemConfig", () => {
       permissionReviewLog: false,
       yoloMode: true,
       doublePressToConfirm: true,
+      sessionApprovalScope: "parent-dir",
     });
   });
 
@@ -126,6 +127,23 @@ describe("normalizePermissionSystemConfig", () => {
       doublePressToConfirm: false,
     });
     expect(result.doublePressToConfirm).toBe(false);
+  });
+
+  it("defaults sessionApprovalScope to parent-dir when missing", () => {
+    expect(normalizePermissionSystemConfig({}).sessionApprovalScope).toBe(
+      "parent-dir",
+    );
+  });
+
+  it("keeps a configured sessionApprovalScope", () => {
+    expect(
+      normalizePermissionSystemConfig({ sessionApprovalScope: "repo-root" })
+        .sessionApprovalScope,
+    ).toBe("repo-root");
+    expect(
+      normalizePermissionSystemConfig({ sessionApprovalScope: 2 })
+        .sessionApprovalScope,
+    ).toBe(2);
   });
 
   it("includes forwardingTimeoutMs when a valid positive integer is provided", () => {

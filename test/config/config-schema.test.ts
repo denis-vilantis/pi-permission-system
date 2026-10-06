@@ -54,6 +54,14 @@ describe("unifiedConfigSchema", () => {
           .success,
       ).toBe(true);
     });
+
+    it("accepts every sessionApprovalScope spelling", () => {
+      for (const scope of ["parent-dir", "repo-root", 0, 3]) {
+        expect(unifiedConfigSchema.safeParse({ sessionApprovalScope: scope }).success).toBe(
+          true,
+        );
+      }
+    });
   });
 
   describe("invalid configs are rejected", () => {
@@ -80,6 +88,21 @@ describe("unifiedConfigSchema", () => {
     it("rejects a zero toolInputPreviewMaxLength", () => {
       expect(
         unifiedConfigSchema.safeParse({ toolInputPreviewMaxLength: 0 }).success,
+      ).toBe(false);
+    });
+
+    it("rejects an unknown sessionApprovalScope string", () => {
+      expect(
+        unifiedConfigSchema.safeParse({ sessionApprovalScope: "repo" }).success,
+      ).toBe(false);
+    });
+
+    it("rejects a negative or fractional sessionApprovalScope", () => {
+      expect(
+        unifiedConfigSchema.safeParse({ sessionApprovalScope: -1 }).success,
+      ).toBe(false);
+      expect(
+        unifiedConfigSchema.safeParse({ sessionApprovalScope: 1.5 }).success,
       ).toBe(false);
     });
 
